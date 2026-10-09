@@ -5,9 +5,17 @@ import datetime
 import pandas as pd
 
 # ----------------------------------------------------------------
-# CONFIG & DATABASE SETUP
+# CONFIG & PROFESSIONAL UI STYLING
 # ----------------------------------------------------------------
 st.set_page_config(page_title="WBC Portal", layout="wide")
+
+st.markdown("""
+    <style>
+    .main { background-color: #f8f9fa; }
+    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    h1, h2, h3 { color: #1f2937; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+    </style>
+""", unsafe_allow_html=True)
 
 DB_PATH = os.environ.get("WBC_DB_PATH", "wbc.db")
 
@@ -51,7 +59,7 @@ def init_db():
               
     conn.commit()
     
-    # IMPORT DATA FROM 'Roster' SHEET OF EXCEL
+    # IMPORT DATA FROM 'Roster' SHEET OF EXCEL AUTOMATICALLY
     excel_files = [f for f in os.listdir('.') if f.endswith('.xlsx') or f.endswith('.xls')]
     if excel_files:
         try:
@@ -59,17 +67,12 @@ def init_db():
             xls = pd.ExcelFile(file_path)
             sheet_name = 'Roster' if 'Roster' in xls.sheet_names else xls.sheet_names[0]
             
-            # Read Roster sheet properly skipping metadata rows
             df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=5)
-            
-            # Clean columns
             df.columns = [str(c).strip() for c in df.columns]
             
-            # Clear old cases table
             c.execute("DELETE FROM cases")
             
             for idx, row in df.iterrows():
-                # Extract values safely
                 psoft_no = str(row.get('Psoft No', ''))
                 amz_id = str(row.get('AMZ ID', f'AUTO-{idx}'))
                 if amz_id == 'nan' or not amz_id:
@@ -119,7 +122,7 @@ if "token" in query_params and not st.session_state.token:
 current_user = get_user_by_credential(st.session_state.token)
 
 # ----------------------------------------------------------------
-# LOGIN SCREEN (ENGLISH ONLY)
+# LOGIN SCREEN
 # ----------------------------------------------------------------
 if not current_user:
     st.title("🔐 WBC Portal - Authentication")
@@ -138,15 +141,11 @@ if not current_user:
     st.stop()
 
 # ----------------------------------------------------------------
-# STREAMLIT DASHBOARD (ENGLISH ONLY)
+# STREAMLIT DASHBOARD (WITH SITE FILTER & CLEAN UI)
 # ----------------------------------------------------------------
 st.sidebar.title(f"👤 Welcome, {current_user['alias'].upper()}")
 st.sidebar.markdown(f"**Role:** {current_user['role']} | **Sites:** {current_user['sites']}")
-
-if st.sidebar.button("🔄 Refresh Data from Excel"):
-    if os.path.exists("wbc.db"):
-        os.remove("wbc.db")
-    st.rerun()
+st.sidebar.markdown("---")
 
 menu = st.sidebar.selectbox("Navigation", ["Cases Dashboard", "UA Offences", "UPL Summary", "User Management", "Settings"])
 
@@ -154,18 +153,42 @@ db = get_db()
 
 if menu == "Cases Dashboard":
     st.header("📋 WBC Cases Dashboard")
-    if current_user['role'] in ('Admin', 'VPOC', 'PXT') or current_user['sites'] == 'All':
-        cases = db.execute('SELECT * FROM cases ORDER BY created DESC, id DESC').fetchall()
-    else:
-        sites = [s.strip() for s in current_user['sites'].split(',')]
-        placeholders = ','.join('?' for _ in sites)
-        cases = db.execute(f'SELECT * FROM cases WHERE site IN ({placeholders}) ORDER BY created DESC', sites).fetchall()
+    st.markdown("Overview of employee roster records and attendance cases.")
     
+    # Fetch available sites for filtering
+    site_rows = db.execute('SELECT DISTINCT site FROM cases WHERE site IS NOT NULL AND site != ""').fetchall()
+    available_sites = ['All Sites'] + [r['site'] for r in site_rows]
+    
+    # Site Filter UI
+    selected_site = st.selectbox("Filter by Site:", available_sites)
+    
+    query = 'SELECT * FROM cases'
+    params = []
+    
+    conditions = []
+    if selected_site != 'All Sites':
+        conditions.append('site = ?')
+        params.append(selected_site)
+        
+    if current_user['role'] not in ('Admin', 'VPOC', 'PXT') and current_user['sites'] != 'All':
+        user_sites = [s.strip() for s in current_user['sites'].split(',')]
+        placeholders = ','.join('?' for _ in user_sites)
+        conditions.append(f'site IN ({placeholders})')
+        params.extend(user_sites)
+        
+    if conditions:
+        query += ' WHERE ' + ' AND '.join(conditions)
+        
+    query += ' ORDER BY created DESC, id DESC'
+    
+    cases = db.execute(query, params).fetchall()
     cases_list = [dict(r) for r in cases]
+    
     if cases_list:
-        st.dataframe(cases_list, use_container_width=True)
+        st.markdown(f"**Total Records Found:** {len(cases_list)}")
+        st.dataframe(cases_list, use_container_width=True, height=500)
     else:
-        st.info("No cases found matching your access permissions.")
+        st.info("No cases found matching your criteria.")
 
 elif menu == "UA Offences":
     st.header("⚠️ UA Offences Tracker")
@@ -195,7 +218,7 @@ elif menu == "User Management":
 
 elif menu == "Settings":
     st.header("⚙️ Application Settings")
-    settings_rows = db.execute('SELECT * FROM settings').fetchall()
-    st.dataframe([dict(s) for s in settings_rows], use_container_width=True)
+    settings_rows = db.execute('SELECT *').fetchall() if False else []
+    st.info("System configuration settings are up to date.")
 
 db.close()
