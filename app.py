@@ -51,7 +51,7 @@ def init_db():
               
     conn.commit()
     
-    # FLEXIBLE AUTO-IMPORT EXCEL FILE USING SUBSTRING MATCHING
+    # EXACT COLUMN MATCHING AUTO-IMPORT FROM EXCEL
     count = c.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
     if count == 0:
         excel_files = [f for f in os.listdir('.') if f.endswith('.xlsx') or f.endswith('.xls')]
@@ -61,26 +61,26 @@ def init_db():
                 df = pd.read_excel(file_path)
                 
                 for _, row in df.iterrows():
+                    # Clean column names mapping
                     row_dict = {str(k).strip().lower(): v for k, v in row.items() if pd.notna(v)}
                     
-                    def find_by_sub(sub_list):
-                        for col in row_dict.keys():
-                            for sub in sub_list:
-                                if sub in col:
-                                    return str(row_dict[col])
+                    def get_field(possible_keys):
+                        for k in possible_keys:
+                            if k in row_dict:
+                                return str(row_dict[k])
                         return ""
 
-                    case_id = find_by_sub(['case_id', 'id']) or f"AUTO-{datetime.datetime.now().timestamp()}"
-                    login = find_by_sub(['login', 'user', 'alias']) or 'unknown'
-                    empid = find_by_sub(['empid', 'emp_id', 'employee'])
-                    name = find_by_sub(['name', 'worker'])
-                    site = find_by_sub(['site', 'loc', 'location'])
-                    mgr = find_by_sub(['mgr', 'manager', 'supervisor'])
-                    shift = find_by_sub(['shift'])
-                    agency = find_by_sub(['agency', 'vendor'])
-                    absent = find_by_sub(['absent', 'absence'])
-                    created = find_by_sub(['created', 'date']) or str(datetime.date.today())
-                    status = find_by_sub(['status']) or 'Open'
+                    case_id = get_field(['id', 'case id', 'case_id']) or f"AUTO-{datetime.datetime.now().timestamp()}"
+                    login = get_field(['login', 'username', 'user', 'alias']) or 'unknown'
+                    empid = get_field(['empid', 'emp id', 'employee id', 'emp_id'])
+                    name = get_field(['name', 'employee name', 'full name', 'worker'])
+                    site = get_field(['site', 'location', 'facility'])
+                    mgr = get_field(['mgr', 'manager', 'supervisor', 'reporting manager'])
+                    shift = get_field(['shift', 'timing'])
+                    agency = get_field(['agency', 'vendor'])
+                    absent = get_field(['absent', 'absence date', 'date of absence', 'absent_date'])
+                    created = get_field(['created', 'created date', 'date'], str(datetime.date.today()))
+                    status = get_field(['status'], 'Open')
                     
                     c.execute('''INSERT OR REPLACE INTO cases (
                         id, login, empid, name, site, mgr, shift, agency, absent, created, status
@@ -89,7 +89,7 @@ def init_db():
                 
                 conn.commit()
             except Exception as e:
-                print("Error auto-importing excel:", e)
+                print("Error during auto-import:", e)
                 
     conn.close()
 
@@ -116,26 +116,26 @@ if "token" in query_params and not st.session_state.token:
 current_user = get_user_by_credential(st.session_state.token)
 
 # ----------------------------------------------------------------
-# LOGIN SCREEN
+# LOGIN SCREEN (ENGLISH ONLY)
 # ----------------------------------------------------------------
 if not current_user:
     st.title("🔐 WBC Portal - Authentication")
-    st.markdown("Apna alias likhein (mis ke taur par **javmuhak** ya **mnnafee**) aur login karein.")
+    st.markdown("Please enter your user alias (e.g., **javmuhak** or **mnnafee**) to sign in.")
     
     input_val = st.text_input("Enter Alias:", value="javmuhak")
     if st.button("Login"):
         user = get_user_by_credential(input_val)
         if user:
             st.session_state.token = user['alias']
-            st.success(f"Khushamdid, {user['alias'].upper()}! Role: {user['role']}")
+            st.success(f"Welcome, {user['alias'].upper()}! Role: {user['role']}")
             st.rerun()
         else:
-            st.error("Invalid alias. Dobara check karein.")
+            st.error("Invalid alias. Please verify and try again.")
     
     st.stop()
 
 # ----------------------------------------------------------------
-# STREAMLIT DASHBOARD
+# STREAMLIT DASHBOARD (ENGLISH ONLY)
 # ----------------------------------------------------------------
 st.sidebar.title(f"👤 Welcome, {current_user['alias'].upper()}")
 st.sidebar.markdown(f"**Role:** {current_user['role']} | **Sites:** {current_user['sites']}")
@@ -162,7 +162,7 @@ if menu == "Cases Dashboard":
     if cases_list:
         st.dataframe(cases_list, use_container_width=True)
     else:
-        st.info("No cases found in the database.")
+        st.info("No cases found matching your access permissions.")
 
 elif menu == "UA Offences":
     st.header("⚠️ UA Offences Tracker")
