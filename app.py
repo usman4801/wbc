@@ -20,12 +20,14 @@ st.set_page_config(page_title="WBC Portal", page_icon="🛡️", layout="wide",
 
 DB_PATH = os.environ.get("WBC_DB_PATH", "wbc.db")
 PAGE_SIZE = 8
+TOP_N_SITES = 3                                                   # Cases by Site + mountain chart show this many
 
 UAL = ["", "Verbal Coaching", "Documented Coaching", "First Warning",
        "Second Warning", "Final Warning", "Termination"]
 REASONS = {"Sick Leave": "Sick Leave", "Authorized": "Authorized", "Unauthorized": "Unauthorized",
            "Incorrect Entry on DWD": "Incorrect Entry on DWD", "Converted to PL": "Converted to PL"}
 NO_DOC = {"Incorrect Entry on DWD", "Converted to PL"}            # no document needed
+OPTIONAL_DOC = {"Sick Leave"}                                     # upload offered, but case can be submitted without it
 UPL_REVERSING = {"Incorrect", "Incorrect Entry on DWD", "Converted to PL"}   # take a day off UPL
 DOC_TYPES = ["", "Medical Certificate", "HRBP Approval", "Warning Letter", "Email Approval", "Other"]
 ADMIN_ROLES = ("admin", "hrbp")                                   # lower-case; can override escalation level
@@ -176,9 +178,25 @@ h1,h2,h3{color:var(--navy);}
 .bar span{display:block;height:100%;border-radius:99px;}
 .site-p{font-size:.7rem;color:var(--muted);text-align:right;}
 
+/* ---------- mountain chart widget ---------- */
+.mtn-top{display:flex;justify-content:space-between;align-items:center;gap:10px;
+  background:linear-gradient(135deg,#f3f0ff,#e8f0ff);border-radius:12px;padding:10px 14px;margin:8px 0 6px;}
+.mtn-k{font-size:.66rem;font-weight:700;color:#6d5bd0;text-transform:uppercase;letter-spacing:.5px;}
+.mtn-v{font-size:1.25rem;font-weight:800;color:var(--navy);line-height:1.15;}
+.mtn-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:999px;color:#fff;
+  font-size:.74rem;font-weight:700;background:linear-gradient(135deg,#9a88f7,#7b6be8);
+  box-shadow:0 4px 12px rgba(123,107,232,.26);white-space:nowrap;}
+.mtn-cap{font-size:.68rem;color:var(--muted);margin:2px 0 0 2px;}
+.mtn-legend{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:6px;}
+.mtn-tile{border:1px solid var(--line);border-top-width:3px;border-radius:10px;padding:7px 10px;background:#fff;}
+.mtn-tile em{display:block;font-style:normal;font-size:.72rem;font-weight:600;color:#475569;}
+.mtn-tile b{display:block;font-size:1.1rem;font-weight:800;color:var(--navy);line-height:1.2;}
+.mtn-tile small{display:block;font-size:.66rem;color:var(--muted);}
+
 /* ---------- dialog ---------- */
 .kv{display:grid;grid-template-columns:130px 1fr;gap:7px 12px;font-size:.84rem;}
 .kv b{color:#475569;font-weight:600;}
+.kv.kv2{grid-template-columns:120px 1fr 120px 1fr;}
 .esc-box{background:linear-gradient(135deg,#fff1f2,#fef3c7);border:1.5px solid #f97316;border-radius:10px;
   padding:10px 14px;margin:4px 0 10px;font-size:.8rem;color:#78350f;line-height:1.6;}
 .esc-t{font-size:.68rem;font-weight:700;color:#9a3412;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px;}
@@ -206,6 +224,7 @@ ICONS = {
     "cal": '<rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 10h16M9 3v4M15 3v4"/>',
     "user": '<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/>',
     "list": '<path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/>',
+    "chart": '<path d="M3 20h18"/><path d="M4 16l5-6 4 4 7-9"/>',
 }
 
 
@@ -591,25 +610,128 @@ def agency_filter(df, key, col):
     return df if pick == "All" else df[ag == pick]
 
 
-def sites_html(df, show_empty=False):
-    smap_sites = []
-    if show_empty:
-        allowed = allowed_sites(current())
-        smap_sites = [s for s in site_meta(get_site_map()) if allowed is None or s in allowed]
-    counts = df["site"].fillna("").replace("", "Unassigned").value_counts().to_dict() if not df.empty else {}
-    for s in smap_sites:
-        counts.setdefault(s, 0)
-    if not counts:
-        return '<div class="card-s" style="padding:16px 0">No data yet.</div>'
-    items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    total, top = max(len(df), 1), max(max(counts.values()), 1)
+# ----------------------------------------------------------------
+# CASES BY SITE (top 3, open cases only) + MOUNTAIN CHART
+# ----------------------------------------------------------------
+def top_open_sites(df, n=TOP_N_SITES):
+    """Returns (open cases with a site, [(site, open_count), ...] for the top n sites)."""
+    if df.empty:
+        return df, []
+    op = df[(df["_g"] == "open") & (df["site"].astype(str).str.strip() != "")]
+    counts = op["site"].value_counts().to_dict()
+    top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+    return op, top
+
+
+def sites_html(df):
+    op, top = top_open_sites(df)
+    if not top:
+        return '<div class="card-s" style="padding:16px 0">No open cases right now.</div>'
+    total, peak = max(len(op), 1), max(top[0][1], 1)
     rows = []
-    for i, (site, c) in enumerate(items):
+    for i, (site, c) in enumerate(top):
         col = SITE_COLORS[i % len(SITE_COLORS)]
         rows.append(f'<div class="site-row"><div class="site-l"><i style="background:{col}"></i>{esc(site)}</div>'
-                    f'<div><div class="site-n">{int(c)}</div><div class="bar"><span style="width:{c / top * 100:.0f}%;background:{col}"></span></div></div>'
+                    f'<div><div class="site-n">{int(c)}</div><div class="bar"><span style="width:{c / peak * 100:.0f}%;background:{col}"></span></div></div>'
                     f'<div class="site-p">{c / total * 100:.1f}%</div></div>')
     return '<div class="sites-scroll">' + "".join(rows) + '</div>'
+
+
+def _smooth_path(pts, top, base):
+    """Smooth curve through points (Catmull-Rom -> cubic Bezier), kept inside the plot area."""
+    if len(pts) < 3:
+        return "M" + " L".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+    d = f"M{pts[0][0]:.1f},{pts[0][1]:.1f}"
+    for i in range(len(pts) - 1):
+        p0 = pts[i - 1] if i > 0 else pts[i]
+        p1, p2 = pts[i], pts[i + 1]
+        p3 = pts[i + 2] if i + 2 < len(pts) else p2
+        c1x, c1y = p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6
+        c2x, c2y = p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6
+        c1y, c2y = min(max(c1y, top), base), min(max(c2y, top), base)
+        d += f" C{c1x:.1f},{c1y:.1f} {c2x:.1f},{c2y:.1f} {p2[0]:.1f},{p2[1]:.1f}"
+    return d
+
+
+def mountain_html(df):
+    """Mountain (area) chart: open cases over time for the top 3 sites, plus a leader banner and totals."""
+    op, top = top_open_sites(df)
+    if not top:
+        return '<div class="card-s" style="padding:16px 0">No open cases to compare.</div>'
+    names = [s for s, _ in top]
+    colors = {s: SITE_COLORS[i % len(SITE_COLORS)] for i, s in enumerate(names)}
+    total_open = max(len(op), 1)
+    lead, lead_n = top[0]
+
+    banner = (f'<div class="mtn-top"><div><div class="mtn-k">Highest open cases</div>'
+              f'<div class="mtn-v">🏆 {esc(lead)}</div></div>'
+              f'<div class="mtn-badge">{lead_n} open · {lead_n / total_open * 100:.1f}%</div></div>')
+
+    d = op[op["site"].isin(names) & op["_created"].notna()].copy()
+    if d.empty:
+        chart = '<div class="card-s" style="padding:12px 0">No dated open cases to chart.</div>'
+        caption = ""
+    else:
+        span = (d["_created"].max() - d["_created"].min()).days
+        freq = "W" if span <= 120 else "M"
+        d["_b"] = d["_created"].dt.to_period(freq)
+        buckets = pd.period_range(d["_b"].min(), d["_b"].max(), freq=freq)[-12:]
+        piv = d.groupby(["_b", "site"]).size().unstack(fill_value=0)
+        piv = piv.reindex(index=buckets, columns=names, fill_value=0)
+        series = {s: [int(v) for v in piv[s]] for s in names}
+        n = len(buckets)
+        if n == 1:                                                   # a single bucket: draw it flat so it still shows
+            series = {s: v * 2 for s, v in series.items()}
+        npts = len(series[names[0]])
+        labels = [p.start_time.strftime("%d %b") if freq == "W" else p.strftime("%b %y") for p in buckets]
+        caption = f'<div class="mtn-cap">Open cases by {"week" if freq == "W" else "month"} opened</div>'
+
+        W, H, L, R, T, B = 440, 215, 30, 14, 16, 30
+        base = H - B
+        ymax = max(max(max(v) for v in series.values()), 1)
+        step = max(1, math.ceil(ymax / 4))
+        ytop = step * 4
+
+        def x_at(i):
+            return L + (W - L - R) * i / (npts - 1)
+
+        def y_at(v):
+            return base - (base - T) * v / ytop
+
+        parts = [f'<svg viewBox="0 0 {W} {H}" width="100%" style="display:block"><defs>']
+        for i, s in enumerate(names):
+            c = colors[s]
+            parts.append(f'<linearGradient id="mg{i}" x1="0" y1="0" x2="0" y2="1">'
+                         f'<stop offset="0" stop-color="{c}" stop-opacity=".55"/>'
+                         f'<stop offset="1" stop-color="{c}" stop-opacity=".03"/></linearGradient>')
+        parts.append('</defs>')
+        for k in range(5):                                           # grid + y labels
+            y = y_at(k * step)
+            parts.append(f'<line x1="{L}" y1="{y:.1f}" x2="{W - R}" y2="{y:.1f}" stroke="#eef2f9" stroke-width="1"/>')
+            parts.append(f'<text x="{L - 6}" y="{y + 3:.1f}" text-anchor="end" font-size="9.5" fill="#94a3b8">{k * step}</text>')
+        for i, s in enumerate(names):                                # largest site is drawn first (at the back)
+            pts = [(x_at(j), y_at(v)) for j, v in enumerate(series[s])]
+            line = _smooth_path(pts, T, base)
+            area = f'{line} L{pts[-1][0]:.1f},{base} L{pts[0][0]:.1f},{base} Z'
+            parts.append(f'<path d="{area}" fill="url(#mg{i})"/>')
+            parts.append(f'<path d="{line}" fill="none" stroke="{colors[s]}" stroke-width="2.2" '
+                         f'stroke-linecap="round" stroke-linejoin="round"/>')
+            pk = max(range(npts), key=lambda j: series[s][j])
+            parts.append(f'<circle cx="{pts[pk][0]:.1f}" cy="{pts[pk][1]:.1f}" r="3.6" fill="#fff" '
+                         f'stroke="{colors[s]}" stroke-width="2"/>')
+        for i, lab in enumerate(labels):                             # x labels
+            if n > 6 and i % 2:
+                continue
+            x = (L + W - R) / 2 if n == 1 else x_at(i)
+            parts.append(f'<text x="{x:.1f}" y="{H - 10}" text-anchor="middle" font-size="9.5" fill="#94a3b8">{esc(lab)}</text>')
+        parts.append('</svg>')
+        chart = "".join(parts)
+
+    tiles = []
+    for i, (s, c) in enumerate(top):
+        tiles.append(f'<div class="mtn-tile" style="border-top-color:{colors[s]}"><em>{"🏆 " if i == 0 else ""}{esc(s)}</em>'
+                     f'<b>{int(c)}</b><small>{c / total_open * 100:.1f}% of open</small></div>')
+    return banner + caption + chart + '<div class="mtn-legend">' + "".join(tiles) + '</div>'
 
 
 # ----------------------------------------------------------------
@@ -832,7 +954,8 @@ def show_existing_doc(case_id, filename, tag="a"):
 def close_case(case, user, label, remarks, doc_type, up, override):
     outcome = REASONS[label]
     today = str(datetime.date.today())
-    esc_level, esc_action, valid_until, needs_doc = "", "", "", outcome not in NO_DOC
+    esc_level, esc_action, valid_until = "", "", ""
+    needs_doc = outcome not in NO_DOC and outcome not in OPTIONAL_DOC      # Sick Leave: document is optional
     if outcome == "Unauthorized":
         if override and is_admin_role(user):
             lvl = int(override)
@@ -850,8 +973,10 @@ def close_case(case, user, label, remarks, doc_type, up, override):
             doc_file = save_upload(case["id"], up)
         except Exception as e:
             return False, f"Upload failed: {e}"
-    if outcome in NO_DOC:
+    if outcome in NO_DOC or (outcome in OPTIONAL_DOC and not doc_file):
         doc_type = ""
+    elif outcome == "Sick Leave" and doc_file and not doc_type:
+        doc_type = "Medical Certificate"
     execute("""UPDATE cases SET status='Closed', outcome=?, reason=?, doc_type=?, doc_file=?, closed=?,
                closed_by=?, closedby=?, escalation_level=?, escalation_action=?,
                ua_escalation_level=?, escalation_valid_until=? WHERE id=?""",
@@ -980,7 +1105,8 @@ def case_dialog(case_id):
             ("Name", c["name"]), ("Site", c["site"]), ("Manager", c["mgr"]), ("Shift", c["shift"]),
             ("Agency", c["agency"]), ("Attendance / absent", c["absent"]),
             ("Current UA", f"L{ua['level']} — {UAL[ua['level']]}" if ua["count"] else "None")]
-    st.markdown('<div class="kv">' + "".join(f"<b>{esc(k)}</b><span>{esc(v) or '–'}</span>" for k, v in info) + "</div>",
+    # two columns of label/value pairs, so the form below fits on screen without scrolling
+    st.markdown('<div class="kv kv2">' + "".join(f"<b>{esc(k)}</b><span>{esc(v) or '–'}</span>" for k, v in info) + "</div>",
                 unsafe_allow_html=True)
 
     if c["status"] == "Closed":
@@ -998,36 +1124,43 @@ def case_dialog(case_id):
     prev = {v: k for k, v in REASONS.items()}.get(c.get("outcome") or "", "")
     default = labels.index(prev) if prev in labels else (labels.index("Sick Leave") if c.get("sick_hint") else 0)
     label = st.selectbox("Reason of absence", labels, index=default, key=f"reason_{case_id}")
-    remarks = st.text_area("Remarks", value=c.get("reason") or "", key=f"remarks_{case_id}",
-                           placeholder="Add remarks about this case...")
-    if label == "Select reason...":
-        return
+    chosen = label != "Select reason..."
 
-    override, show_doc, doc_default = "", label not in NO_DOC, ""
-    if label == "Unauthorized":
-        lvl, action, valid = next_escalation(c["login"])
-        if is_admin_role(user):
-            override = st.selectbox("HRBP override (optional)", ["", "1", "2", "3", "4", "5", "6"],
-                                    format_func=lambda v: "— Keep auto level —" if not v else f"L{v} — {UAL[int(v)]}",
-                                    key=f"override_{case_id}")
-            if override:
-                lvl, action = int(override), UAL[int(override)]
-        show_doc = lvl >= 2
-        doc_default = "Warning Letter" if lvl >= 2 else ""
-        st.markdown(f'<div class="esc-box"><div class="esc-t">⚡ Auto Escalation — UA Offence</div>'
-                    f'<span class="esc-lvl">L{lvl} — {esc(action)}</span><br>Valid until: {valid}<br>'
-                    f'Required action: {esc(action)} '
-                    f'{"(No document required for Verbal Coaching)" if lvl <= 1 else "(Warning letter required)"}</div>',
-                    unsafe_allow_html=True)
+    remarks = st.text_area("Remarks", value=c.get("reason") or "", key=f"remarks_{case_id}", height=110,
+                           placeholder="Write your remarks about this case / the conversation with the associate...")
+
+    override, show_doc, doc_default, optional_doc = "", False, "", False
+    if chosen:
+        show_doc = label not in NO_DOC
+        optional_doc = label in OPTIONAL_DOC
+        if label == "Sick Leave":
+            doc_default = "Medical Certificate"
+        if label == "Unauthorized":
+            lvl, action, valid = next_escalation(c["login"])
+            if is_admin_role(user):
+                override = st.selectbox("HRBP override (optional)", ["", "1", "2", "3", "4", "5", "6"],
+                                        format_func=lambda v: "— Keep auto level —" if not v else f"L{v} — {UAL[int(v)]}",
+                                        key=f"override_{case_id}")
+                if override:
+                    lvl, action = int(override), UAL[int(override)]
+            show_doc = lvl >= 2
+            doc_default = "Warning Letter" if lvl >= 2 else ""
+            st.markdown(f'<div class="esc-box"><div class="esc-t">⚡ Auto Escalation — UA Offence</div>'
+                        f'<span class="esc-lvl">L{lvl} — {esc(action)}</span><br>Valid until: {valid}<br>'
+                        f'Required action: {esc(action)} '
+                        f'{"(No document required for Verbal Coaching)" if lvl <= 1 else "(Warning letter required)"}</div>',
+                        unsafe_allow_html=True)
 
     doc_type, up = "", None
     if show_doc:
         d1, d2 = st.columns([1, 2])
+        start = c.get("doc_type") or doc_default
         doc_type = d1.selectbox("Document type", DOC_TYPES, key=f"dtype_{case_id}",
-                                index=DOC_TYPES.index(c["doc_type"]) if c.get("doc_type") in DOC_TYPES
-                                else DOC_TYPES.index(doc_default))
-        up = d2.file_uploader("Supporting document", type=["pdf", "jpg", "jpeg", "png", "doc", "docx"],
-                              key=f"file_{case_id}")
+                                index=DOC_TYPES.index(start) if start in DOC_TYPES else 0)
+        up = d2.file_uploader("Upload sick leave certificate (optional)" if optional_doc else "Supporting document",
+                              type=["pdf", "jpg", "jpeg", "png", "doc", "docx"], key=f"file_{case_id}")
+        if optional_doc:
+            st.caption("Optional - you can submit the case with or without the sick leave document.")
         show_existing_doc(c["id"], c.get("doc_file"), "form")
         if c.get("doc_file"):
             st.caption("Upload a new file only if you want to replace the current one.")
@@ -1039,13 +1172,17 @@ def case_dialog(case_id):
             if st.session_state.get(f"verb_{case_id}"):
                 st.code(st.session_state[f"verb_{case_id}"], language=None)
 
-    if st.button("✅ Close Case", type="primary", key=f"close_{case_id}"):
-        ok, msg = close_case(c, user, label, remarks, doc_type, up, override)
-        if ok:
-            st.session_state["_flash"] = msg
-            st.rerun()
+    # always visible, even before a reason is picked
+    if st.button("✅ Submit", type="primary", key=f"close_{case_id}", use_container_width=True):
+        if not chosen:
+            st.error("Please select a reason of absence before submitting.")
         else:
-            st.error(msg)
+            ok, msg = close_case(c, user, label, remarks, doc_type, up, override)
+            if ok:
+                st.session_state["_flash"] = msg
+                st.rerun()
+            else:
+                st.error(msg)
 
 
 def cases_table(view, page_size=PAGE_SIZE):
@@ -1148,9 +1285,13 @@ def page_dashboard():
 
     with right:
         with st.container(border=True, key="card_sites"):
-            st.markdown(card_header_html("pin", "Cases by Site", "Total cases at each site"), unsafe_allow_html=True)
-            show_empty = st.checkbox("Include sites with no cases", key="sites_empty")
-            st.markdown(sites_html(df, show_empty), unsafe_allow_html=True)
+            st.markdown(card_header_html("pin", "Cases by Site", f"Top {TOP_N_SITES} sites by open cases"),
+                        unsafe_allow_html=True)
+            st.markdown(sites_html(df), unsafe_allow_html=True)
+        with st.container(border=True, key="card_mountain"):
+            st.markdown(card_header_html("chart", "Site Comparison", f"Open cases - top {TOP_N_SITES} sites side by side"),
+                        unsafe_allow_html=True)
+            st.markdown(mountain_html(df), unsafe_allow_html=True)
 
 
 def page_cases():
