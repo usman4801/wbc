@@ -29,6 +29,7 @@ NO_DOC = {"Incorrect Entry on DWD", "Converted to PL"}            # no document 
 UPL_REVERSING = {"Incorrect", "Incorrect Entry on DWD", "Converted to PL"}   # take a day off UPL
 DOC_TYPES = ["", "Medical Certificate", "HRBP Approval", "Warning Letter", "Email Approval", "Other"]
 ADMIN_ROLES = ("admin", "hrbp")                                   # lower-case; can override escalation level
+EXCLUDED_ATTENDANCE = {"P", "OFF"}                                # present / weekly-off rows are not WBC cases
 ALL_ACCESS_ROLES = ("admin", "vpoc", "pxt")                       # see every site
 UPLOAD_DIR = os.environ.get("WBC_UPLOAD_DIR", "wbc_uploads")
 S3_BUCKET = os.environ.get("WBC_S3_BUCKET", "")                   # optional: upload to S3 instead
@@ -220,7 +221,7 @@ BRAND_HTML = """
 <path d="M20 2 4 8v14c0 11 7 18 16 21 9-3 16-10 16-21V8z" fill="url(#bg1)"/>
 <path d="M20 10 10 14v8c0 7 4 11 10 14 6-3 10-7 10-14v-8z" fill="none" stroke="#fff" stroke-width="1.8" opacity=".7"/>
 <path d="M15 22l4 4 7-8" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-<div><b>WBC Portal</b><small>Workplace Behaviour &amp; Compliance</small></div></div>
+<div><b>WBC Portal</b><small>Welcome Back Conversation</small></div></div>
 """
 
 SPARKLE = ('<svg width="14" height="14" viewBox="0 0 24 24" fill="#fff"><path d="M12 2l2.2 6.3L20.5 10l-6.3 2.2L12 18.5l'
@@ -444,6 +445,8 @@ def init_db():
                     agency = str(row.get('3P', ''))
                     attendance = str(row.get('Attendance ', row.get('Attendance', 'Open')))
                     doj = str(row.get('DOJ', str(datetime.date.today())))
+                    if attendance.strip().upper() in EXCLUDED_ATTENDANCE:
+                        continue                                  # Present / OFF - no welcome back conversation needed
 
                     case_id = f"CASE-{psoft_no if psoft_no and psoft_no != 'nan' else idx}"
 
@@ -490,7 +493,9 @@ def load_cases(user):
     for col in CASE_COLS:
         if col not in df.columns:
             df[col] = ""
-    return prepare(df.fillna(""))
+    df = df.fillna("")
+    df = df[~df["absent"].astype(str).str.strip().str.upper().isin(EXCLUDED_ATTENDANCE)]
+    return prepare(df)
 
 
 def query(sql, params=()):
@@ -573,6 +578,17 @@ def site_filters(df, key, cols):
     if country != "All" or bu != "All":
         return df[df["site"].isin(pool)]
     return df
+
+
+def agency_filter(df, key, col):
+    """Agency (3P) filter - like the old portal. Blank agencies are grouped as 'Unassigned'."""
+    ag = df["agency"].astype(str).str.strip().replace({"": "Unassigned", "nan": "Unassigned", "None": "Unassigned"})
+    counts = ag.value_counts().to_dict()
+    opts = ["All"] + sorted(counts)
+    _valid_or_reset(key, opts)
+    pick = col.selectbox("Agency", opts, key=key, label_visibility="collapsed",
+                         format_func=lambda a: "All Agencies" if a == "All" else f"{a} ({counts.get(a, 0)})")
+    return df if pick == "All" else df[ag == pick]
 
 
 def sites_html(df, show_empty=False):
@@ -1101,14 +1117,15 @@ def page_dashboard():
             search = h2.text_input("Search", placeholder="Search by Case ID, Site, Type, Name, Login...",
                                    label_visibility="collapsed", key="q_search")
 
-            f1, f2, f3, f4 = st.columns([1, 0.8, 1.3, 0.9])
+            f1, f2, f3, f4, f5 = st.columns([1, 0.8, 1.2, 1.1, 0.9])
             view = site_filters(df, "dash", [f1, f2, f3])
-            size = int(f4.selectbox("Rows per page", [8, 25, 50, 100, 200], key="q_size",
+            view = agency_filter(view, "dash_agency", f4)
+            size = int(f5.selectbox("Rows per page", [8, 25, 50, 100, 200], key="q_size",
                                     format_func=lambda n: f"{n} / page", label_visibility="collapsed"))
 
             if search.strip():
                 s = search.strip().lower()
-                hay = (view["id"] + " " + view["site"] + " " + view["_type"] + " " + view["name"] + " " + view["login"]).str.lower()
+                hay = (view["id"] + " " + view["site"] + " " + view["_type"] + " " + view["name"] + " " + view["login"] + " " + view["agency"]).str.lower()
                 view = view[hay.str.contains(s, regex=False)]
 
             bar1, bar2, bar3 = st.columns([3, 1, 1], vertical_alignment="center")
@@ -1123,7 +1140,7 @@ def page_dashboard():
                                      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                      key="dl_xlsx_dash", use_container_width=True)
 
-            sig = (search, tuple(st.session_state.get(f"dash_{k}") for k in ("country", "bu", "site")), size)
+            sig = (search, tuple(st.session_state.get(f"dash_{k}") for k in ("country", "bu", "site", "agency")), size)
             if st.session_state.get("_sig") != sig:
                 st.session_state["_sig"] = sig
                 st.session_state.cases_page = 1
@@ -1145,9 +1162,10 @@ def page_cases():
         ("System Status", "Operational")]), unsafe_allow_html=True)
     with st.container(border=True, key="card_cases"):
         st.markdown(card_header_html("list", "All Cases", "Filter and export the full case list"), unsafe_allow_html=True)
-        a, b, c, d = st.columns([1, 0.8, 1.3, 1.2])
+        a, b, c, d, e = st.columns([1, 0.8, 1.2, 1.1, 1.1])
         view = site_filters(df, "cd", [a, b, c])
-        status = d.selectbox("Status", ["All Status", "Open", "In Review / Pending", "Closed"],
+        view = agency_filter(view, "cd_agency", d)
+        status = e.selectbox("Status", ["All Status", "Open", "In Review / Pending", "Closed"],
                              label_visibility="collapsed", key="cd_status")
         if status == "Open":
             view = view[view["_g"] == "open"]
@@ -1237,11 +1255,12 @@ def page_disciplinary():
         st.markdown(card_header_html("check", "Disciplinary Action Register",
                                      "Saved automatically when a case is closed from the Dashboard"),
                     unsafe_allow_html=True)
-        a, b, c, d = st.columns([1, 0.8, 1.3, 1.2])
+        a, b, c, d, e = st.columns([1, 0.8, 1.2, 1.1, 1.1])
         view = site_filters(closed, "da", [a, b, c])
+        view = agency_filter(view, "da_agency", d)
         decisions = ["All Decisions"] + sorted(o for o in closed["outcome"].unique() if o)
         _valid_or_reset("da_outcome", decisions)
-        pick = d.selectbox("Decision", decisions, key="da_outcome", label_visibility="collapsed")
+        pick = e.selectbox("Decision", decisions, key="da_outcome", label_visibility="collapsed")
         if pick != "All Decisions":
             view = view[view["outcome"] == pick]
         out = view[DISC_COLS].sort_values("closed", ascending=False).rename(columns=DISC_LABELS)
@@ -1326,6 +1345,15 @@ def page_settings():
     modified = (datetime.datetime.fromtimestamp(os.path.getmtime(db_path)).strftime("%b %d, %Y %I:%M %p") if exists else "–")
     counts = {t: query(f"SELECT COUNT(*) n FROM {t}")[0]["n"] for t in ("cases", "ua_offences", "upl_summary", "users")}
     excel = [f for f in os.listdir(".") if f.lower().endswith((".xlsx", ".xls"))]
+    src = query("SELECT value FROM settings WHERE key='excel_imported'")
+    if src and src[0]["value"] == "old-db-import":
+        src_label = "Old portal database (imported)"
+    elif src:
+        src_label = f"Excel file: {src[0]['value']} (sheet 'Roster', one case per employee)"
+    elif excel:
+        src_label = f"Excel file in app folder: {excel[0]} (sheet 'Roster')"
+    else:
+        src_label = "No Excel file found - cases come from DWD Sync / manual entry"
     docs = f"S3 bucket: {S3_BUCKET}/{S3_PREFIX}" if S3_BUCKET else os.path.abspath(UPLOAD_DIR)
     with st.container(border=True, key="card_settings"):
         st.markdown(card_header_html("target", "System Status", "Environment and database"), unsafe_allow_html=True)
@@ -1334,7 +1362,7 @@ def page_settings():
             f'<b>DB size / modified</b><span>{size_kb:,.0f} KB / {esc(modified)}</span>'
             f'<b>Records</b><span>{counts["cases"]} cases · {counts["ua_offences"]} UA offences · '
             f'{counts["upl_summary"]} UPL rows · {counts["users"]} users</span>'
-            f'<b>Initial import from</b><span>{esc(excel[0]) if excel else "No Excel file found"}</span>'
+            f'<b>Cases loaded from</b><span>{esc(src_label)}</span>'
             f'<b>Documents saved in</b><span>{esc(docs)}</span>'
             f'<b>Signed in as</b><span>{esc(user["alias"])} ({esc(user["role"])})</span>'
             f'<b>Sites</b><span>{esc(user["sites"])}</span></div>', unsafe_allow_html=True)
@@ -1346,6 +1374,18 @@ def page_settings():
                                    "application/octet-stream", key="dl_db")
 
     if is_admin(user):
+        with st.container(border=True, key="card_clean"):
+            st.markdown(card_header_html("check", "Remove P / OFF cases",
+                                         "Present and weekly-off rows never show in the app; this deletes them from the database"),
+                        unsafe_allow_html=True)
+            n_pf = query("SELECT COUNT(*) n FROM cases WHERE UPPER(TRIM(absent)) IN ('P','OFF') AND status != 'Closed'")[0]["n"]
+            st.write(f"{n_pf} unclosed cases with attendance P or OFF are stored in the database.")
+            sure = st.checkbox("Yes, delete them permanently", key="clean_sure", disabled=n_pf == 0)
+            if st.button("Delete P / OFF cases", disabled=not sure, key="clean_run"):
+                execute("DELETE FROM cases WHERE UPPER(TRIM(absent)) IN ('P','OFF') AND status != 'Closed'")
+                st.session_state["_flash"] = f"{n_pf} P / OFF cases deleted."
+                st.rerun()
+
         with st.container(border=True, key="card_import"):
             st.markdown(card_header_html("list", "Import old database",
                                          "Bring cases, UA offences, UPL, users and sites over from the old portal's wbc.db"),
