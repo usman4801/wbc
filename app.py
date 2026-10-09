@@ -1482,7 +1482,7 @@ def page_users():
         st.markdown(card_header_html("user", "Give Access", "Add a login - they can open the tool straight away"),
                     unsafe_allow_html=True)
         a, b, c, d = st.columns([1.2, 0.8, 1.6, 0.8], vertical_alignment="bottom")
-        a.text_input("User alias", placeholder="e.g. javmuhak", key="acc_alias")
+        a.text_input("User alias", placeholder="e.g. mnnafee", key="acc_alias")
         b.selectbox("Role", ACCESS_ROLES, key="acc_role")
         c.multiselect("Sites - HRBP only (empty = all sites; VPOC always sees all)", sorted(site_meta(get_site_map())), key="acc_sites")
         d.button("Add access", type="primary", key="acc_add", on_click=_add_access, use_container_width=True)
@@ -1620,7 +1620,7 @@ def main():
                 st.markdown(BRAND_HTML + '<div class="login-t">Welcome back</div>'
                             '<div class="login-s">Enter your authorized user alias to access the portal.</div>',
                             unsafe_allow_html=True)
-                alias = st.text_input("User alias", value="javmuhak", placeholder="e.g. javmuhak",
+                alias = st.text_input("User alias", placeholder="e.g. mnnafee",
                                       label_visibility="collapsed")
                 if st.button("Sign In", use_container_width=True):
                     u = get_user_by_credential(alias)
