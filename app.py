@@ -2,7 +2,12 @@ import streamlit as st
 import sqlite3
 import os
 import io
+import csv
+import copy
 import math
+import shutil
+import hashlib
+import tempfile
 import datetime
 import html as _html
 import pandas as pd
@@ -23,7 +28,8 @@ REASONS = {"Sick Leave": "Sick Leave", "Authorized": "Authorized", "Unauthorized
 NO_DOC = {"Incorrect Entry on DWD", "Converted to PL"}            # no document needed
 UPL_REVERSING = {"Incorrect", "Incorrect Entry on DWD", "Converted to PL"}   # take a day off UPL
 DOC_TYPES = ["", "Medical Certificate", "HRBP Approval", "Warning Letter", "Email Approval", "Other"]
-ADMIN_ROLES = ("Admin", "HRBP")                                   # can override escalation level
+ADMIN_ROLES = ("admin", "hrbp")                                   # lower-case; can override escalation level
+ALL_ACCESS_ROLES = ("admin", "vpoc", "pxt")                       # see every site
 UPLOAD_DIR = os.environ.get("WBC_UPLOAD_DIR", "wbc_uploads")
 S3_BUCKET = os.environ.get("WBC_S3_BUCKET", "")                   # optional: upload to S3 instead
 S3_PREFIX = os.environ.get("WBC_S3_PREFIX", "wbc-uploads")
@@ -32,7 +38,31 @@ CASE_COLS = ["id", "login", "empid", "name", "site", "mgr", "shift", "agency", "
              "created", "status", "outcome", "reason", "doc_type", "doc_file", "notes",
              "closed", "source", "sick_hint", "ua_escalation_level",
              "escalation_valid_until", "closedby", "on_site", "closed_by",
-             "escalation_level", "escalation_action"]
+             "escalation_level", "escalation_action", "present_status"]
+
+# ----------------------------------------------------------------
+# SITE MAP  (ported from the old portal: Country -> BU -> Sites)
+# ----------------------------------------------------------------
+SITE_MAP_DEFAULT = {
+    "ARE": {
+        "FC/SC": ["AUH1", "AUH3", "DAD1", "DWC3", "DWC5", "DXB3", "DXB5", "DXB8"],
+        "AMZL": ["AUH2", "DAD2", "DAD6", "DAD9", "DDB3", "DDB6", "DDB7", "DSH6", "DUD2", "DUD3",
+                 "DUF1", "DUF2", "DXD7"],
+    },
+    "EGY": {
+        "FC/SC": ["CAI6", "CAI9", "DEG1", "DGI8", "DXA5", "EGY2", "SPX5"],
+        "AMZL": ["DAI3", "DAI4", "DEX5", "DGI7", "DRO5", "DTT4"],
+    },
+    "SAU": {
+        "FC/SC": ["JED4", "JED7", "RUH8", "RYD5"],
+        "AMZL": ["DAK1", "DHU3", "DJD1", "DJD2", "DJD7", "DME6", "DMK2", "DMM2", "DMM5", "DRU4",
+                 "DRY3", "DRY4", "DRY7", "RUH5"],
+    },
+    "TUR": {"FC/SC": ["IST2"], "AMZL": []},
+}
+COUNTRY_LABELS = {"ARE": "UAE", "EGY": "Egypt", "SAU": "KSA", "TUR": "Turkiye"}
+COUNTRY_FLAGS = {"ARE": "🇦🇪", "EGY": "🇪🇬", "SAU": "🇸🇦", "TUR": "🇹🇷"}
+TARGET_SITES = ["AUH1", "AUH3", "DAD1", "DWC3", "DWC5", "DXB3", "DXB5", "DXB8"]   # DWD sync default
 
 
 # ----------------------------------------------------------------
@@ -134,6 +164,7 @@ h1,h2,h3{color:var(--navy);}
 [class*="st-key-pager"] button[data-testid="stBaseButton-primary"]{background:var(--blue);border-color:var(--blue);color:#fff;}
 
 /* ---------- cases by site ---------- */
+.sites-scroll{max-height:520px;overflow-y:auto;}
 .site-row{display:grid;grid-template-columns:70px 1fr 46px;align-items:center;gap:8px;
   padding:11px 0;border-bottom:1px solid #f0f3f8;}
 .site-row:last-child{border-bottom:none;}
@@ -250,18 +281,38 @@ def pill_html(group, label):
     return f'<span class="pill {cls}">{esc(label)}</span>'
 
 
-def sites_html(df):
-    if df.empty:
-        return '<div class="card-s" style="padding:16px 0">No data yet.</div>'
-    counts = df["site"].fillna("").replace("", "Unassigned").value_counts().head(5)
-    total, top = len(df), int(counts.max())
-    rows = []
-    for i, (site, c) in enumerate(counts.items()):
-        col = SITE_COLORS[i % len(SITE_COLORS)]
-        rows.append(f'<div class="site-row"><div class="site-l"><i style="background:{col}"></i>{esc(site)}</div>'
-                    f'<div><div class="site-n">{int(c)}</div><div class="bar"><span style="width:{c / top * 100:.0f}%;background:{col}"></span></div></div>'
-                    f'<div class="site-p">{c / total * 100:.1f}%</div></div>')
-    return "".join(rows)
+# ----------------------------------------------------------------
+# ACCESS HELPERS
+# ----------------------------------------------------------------
+def is_all_access(user):
+    """Admin / VPOC / PXT, or a user whose sites column is 'All' (any case)."""
+    return (str(user.get("role", "")).lower() in ALL_ACCESS_ROLES
+            or str(user.get("sites") or "").strip().lower() == "all")
+
+
+def allowed_sites(user):
+    """None = every site, otherwise the list of sites this user may see."""
+    if is_all_access(user):
+        return None
+    return [s.strip() for s in str(user.get("sites") or "").split(",") if s.strip()]
+
+
+def is_admin(user):
+    return str(user.get("role", "")).lower() == "admin"
+
+
+def is_admin_role(user):
+    return str(user.get("role", "")).lower() in ADMIN_ROLES
+
+
+def to_excel_bytes(df, sheet="Cases"):
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name=sheet)
+        return buf.getvalue()
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------
@@ -292,12 +343,19 @@ def prepare(df):
 
 
 # ----------------------------------------------------------------
-# DATABASE  (unchanged logic from your original file)
+# DATABASE
 # ----------------------------------------------------------------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def ensure_columns(c, table, cols):
+    have = {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+    for col, ddl in cols.items():
+        if col not in have:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
 
 
 def init_db():
@@ -321,30 +379,46 @@ def init_db():
         added TEXT, token TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS upl_summary (login TEXT PRIMARY KEY, site TEXT DEFAULT '', scheduled_days INTEGER DEFAULT 0, upl_days INTEGER DEFAULT 0, updated TEXT DEFAULT '')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS access_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, alias TEXT, name TEXT, email TEXT,
+        country TEXT, bu TEXT, sites TEXT, role TEXT, status TEXT DEFAULT "pending",
+        requested_at TEXT DEFAULT '', reviewed_by TEXT, reviewed_at TEXT,
+        reject_reason TEXT DEFAULT "")''')
+    c.execute('''CREATE TABLE IF NOT EXISTS custom_sites (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        country TEXT NOT NULL, bu TEXT NOT NULL, site TEXT NOT NULL,
+        active INTEGER DEFAULT 1, added_by TEXT, added_at TEXT,
+        UNIQUE(country, bu, site))''')
 
-    # columns used by the case-close flow (same names as the old Flask schema)
-    have = {r[1] for r in c.execute("PRAGMA table_info(cases)").fetchall()}
-    for col, ddl in (("closed_by", "TEXT DEFAULT ''"), ("escalation_level", "TEXT DEFAULT ''"),
-                     ("escalation_action", "TEXT DEFAULT ''")):
-        if col not in have:
-            c.execute(f"ALTER TABLE cases ADD COLUMN {col} {ddl}")
+    # columns used by the case-close flow / old portal schema (safe, idempotent)
+    ensure_columns(c, "cases", {
+        "closed_by": "TEXT DEFAULT ''", "escalation_level": "TEXT DEFAULT ''",
+        "escalation_action": "TEXT DEFAULT ''", "present_status": "TEXT DEFAULT ''",
+        "ua_escalation_level": "INTEGER DEFAULT 0", "escalation_valid_until": "TEXT DEFAULT ''",
+        "closedby": "TEXT DEFAULT ''", "on_site": "TEXT DEFAULT ''"})
+    ensure_columns(c, "ua_offences", {"offence_type": "TEXT DEFAULT ''", "name": "TEXT DEFAULT ''",
+                                      "empid": "TEXT DEFAULT ''"})
+    ensure_columns(c, "users", {"token": "TEXT", "added": "TEXT"})
 
     # Indexes
     c.execute("CREATE INDEX IF NOT EXISTS idx_cases_login ON cases(login)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_cases_site ON cases(site)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_cases_created ON cases(created)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ua_login ON ua_offences(login)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ua_site ON ua_offences(site)")
 
-    # Seed default users
-    c.execute("INSERT OR REPLACE INTO users (alias, role, sites, added, token) VALUES ('mnnafee', 'Admin', 'All', ?, 'mnnafee')",
+    # Seed default users - IGNORE (not REPLACE) so imported users / tokens are never overwritten
+    c.execute("INSERT OR IGNORE INTO users (alias, role, sites, added, token) VALUES ('mnnafee', 'Admin', 'All', ?, 'mnnafee')",
               (str(datetime.date.today()),))
-    c.execute("INSERT OR REPLACE INTO users (alias, role, sites, added, token) VALUES ('javmuhak', 'VPOC', 'All', ?, 'javmuhak')",
+    c.execute("INSERT OR IGNORE INTO users (alias, role, sites, added, token) VALUES ('javmuhak', 'VPOC', 'All', ?, 'javmuhak')",
               (str(datetime.date.today()),))
-
     conn.commit()
 
-    # AUTO-IMPORT DATA FROM 'Roster' SHEET OF EXCEL
+    # ONE-TIME AUTO-IMPORT FROM 'Roster' SHEET OF EXCEL (only into an empty database, only once)
     count = c.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
-    if count == 0:
+    done = c.execute("SELECT 1 FROM settings WHERE key='excel_imported'").fetchone()
+    if count == 0 and not done:
         excel_files = [f for f in os.listdir('.') if f.endswith('.xlsx') or f.endswith('.xls')]
         if excel_files:
             try:
@@ -363,6 +437,8 @@ def init_db():
 
                     name = str(row.get('EMP Name', ''))
                     site = str(row.get('Building', 'AUH1'))
+                    if site.strip().lower() in ("nan", ""):
+                        site = ""
                     mgr = str(row.get('Line Manager', ''))
                     shift = str(row.get('Shift', ''))
                     agency = str(row.get('3P', ''))
@@ -376,6 +452,7 @@ def init_db():
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                               (str(case_id), str(amz_id), str(psoft_no), str(name), str(site), str(mgr), str(shift), str(agency), str(attendance), str(doj)[:10], "Open"))
 
+                c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('excel_imported', ?)", (file_path,))
                 conn.commit()
             except Exception as e:
                 print("Error loading excel sheet:", e)
@@ -386,23 +463,28 @@ def init_db():
 def get_user_by_credential(val):
     if not val:
         return None
+    val = val.strip()
     db = get_db()
-    row = db.execute('SELECT * FROM users WHERE token=? OR alias=?', (val.strip().lower(), val.strip().lower())).fetchone()
+    # tokens from the old portal are mixed-case, aliases are lower-case
+    row = db.execute('SELECT * FROM users WHERE token=? OR alias=?', (val, val.lower())).fetchone()
     db.close()
     return dict(row) if row else None
 
 
 def load_cases(user):
-    query, params, conds = 'SELECT * FROM cases', [], []
-    if user['role'] not in ('Admin', 'VPOC', 'PXT') and user['sites'] != 'All':
-        user_sites = [s.strip() for s in user['sites'].split(',')]
-        conds.append(f"site IN ({','.join('?' for _ in user_sites)})")
-        params.extend(user_sites)
+    query_, params, conds = 'SELECT * FROM cases', [], []
+    allowed = allowed_sites(user)
+    if allowed is not None:
+        if not allowed:
+            conds.append("1=0")
+        else:
+            conds.append(f"site IN ({','.join('?' for _ in allowed)})")
+            params.extend(allowed)
     if conds:
-        query += ' WHERE ' + ' AND '.join(conds)
-    query += ' ORDER BY created DESC, id DESC'
+        query_ += ' WHERE ' + ' AND '.join(conds)
+    query_ += ' ORDER BY created DESC, id DESC'
     db = get_db()
-    rows = [dict(r) for r in db.execute(query, params).fetchall()]
+    rows = [dict(r) for r in db.execute(query_, params).fetchall()]
     db.close()
     df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=CASE_COLS)
     for col in CASE_COLS:
@@ -433,6 +515,223 @@ def read_table(sql):
 
 
 # ----------------------------------------------------------------
+# SITES  (country -> BU -> site, plus admin-added custom sites)
+# ----------------------------------------------------------------
+def get_site_map():
+    merged = copy.deepcopy(SITE_MAP_DEFAULT)
+    try:
+        for r in query("SELECT country, bu, site FROM custom_sites WHERE active=1"):
+            merged.setdefault(r["country"], {}).setdefault(r["bu"], [])
+            if r["site"] not in merged[r["country"]][r["bu"]]:
+                merged[r["country"]][r["bu"]].append(r["site"])
+    except Exception:
+        pass
+    return merged
+
+
+def site_meta(smap):
+    """site -> (country, bu)"""
+    return {s: (c, bu) for c, bus in smap.items() for bu, ss in bus.items() for s in ss}
+
+
+def _valid_or_reset(key, options):
+    if key in st.session_state and st.session_state[key] not in options:
+        del st.session_state[key]
+
+
+def site_filters(df, key, cols):
+    """Country -> BU -> Site selector (from the old portal). Returns the filtered cases."""
+    smap = get_site_map()
+    meta = site_meta(smap)
+    allowed = allowed_sites(current())
+    counts = df["site"].value_counts().to_dict() if not df.empty else {}
+
+    country_opts = ["All"] + list(smap.keys())
+    _valid_or_reset(f"{key}_country", country_opts)
+    country = cols[0].selectbox(
+        "Country", country_opts, key=f"{key}_country", label_visibility="collapsed",
+        format_func=lambda c: "All Countries" if c == "All" else f"{COUNTRY_FLAGS.get(c, '')} {COUNTRY_LABELS.get(c, c)}")
+
+    bu_opts = ["All"] + sorted({bu for c, bus in smap.items() if country in ("All", c) for bu in bus})
+    _valid_or_reset(f"{key}_bu", bu_opts)
+    bu = cols[1].selectbox("BU", bu_opts, key=f"{key}_bu", label_visibility="collapsed",
+                           format_func=lambda b: "All BUs" if b == "All" else b)
+
+    pool = [s for s, (c, b) in meta.items() if country in ("All", c) and bu in ("All", b)]
+    if country == "All" and bu == "All":
+        pool += [s for s in counts if s and s not in meta]          # sites found in data but not in the map
+    if allowed is not None:
+        pool = [s for s in pool if s in allowed]
+    pool = sorted(set(pool))
+    site_opts = ["All"] + pool
+    _valid_or_reset(f"{key}_site", site_opts)
+    site = cols[2].selectbox("Site", site_opts, key=f"{key}_site", label_visibility="collapsed",
+                             format_func=lambda s: "All Sites" if s == "All" else f"{s} ({counts.get(s, 0)})")
+
+    if site != "All":
+        return df[df["site"] == site]
+    if country != "All" or bu != "All":
+        return df[df["site"].isin(pool)]
+    return df
+
+
+def sites_html(df, show_empty=False):
+    smap_sites = []
+    if show_empty:
+        allowed = allowed_sites(current())
+        smap_sites = [s for s in site_meta(get_site_map()) if allowed is None or s in allowed]
+    counts = df["site"].fillna("").replace("", "Unassigned").value_counts().to_dict() if not df.empty else {}
+    for s in smap_sites:
+        counts.setdefault(s, 0)
+    if not counts:
+        return '<div class="card-s" style="padding:16px 0">No data yet.</div>'
+    items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    total, top = max(len(df), 1), max(max(counts.values()), 1)
+    rows = []
+    for i, (site, c) in enumerate(items):
+        col = SITE_COLORS[i % len(SITE_COLORS)]
+        rows.append(f'<div class="site-row"><div class="site-l"><i style="background:{col}"></i>{esc(site)}</div>'
+                    f'<div><div class="site-n">{int(c)}</div><div class="bar"><span style="width:{c / top * 100:.0f}%;background:{col}"></span></div></div>'
+                    f'<div class="site-p">{c / total * 100:.1f}%</div></div>')
+    return '<div class="sites-scroll">' + "".join(rows) + '</div>'
+
+
+# ----------------------------------------------------------------
+# OLD-DATABASE IMPORT  (merge / replace from a wbc.db of the old portal)
+# ----------------------------------------------------------------
+# table -> (primary key column or None, de-dupe condition used when merging)
+IMPORT_TABLES = {
+    "cases": ("id", None),
+    "upl_summary": ("login", None),
+    "users": ("alias", None),
+    "ua_offences": (None, "m.login=o.login AND m.date=o.date AND IFNULL(m.offence_type,'')=IFNULL(o.offence_type,'')"),
+    "access_requests": (None, "IFNULL(m.alias,'')=IFNULL(o.alias,'') AND IFNULL(m.requested_at,'')=IFNULL(o.requested_at,'')"),
+    "custom_sites": (None, "m.country=o.country AND m.bu=o.bu AND m.site=o.site"),
+}
+
+
+def import_old_db(raw, replace=False, drop_roster_placeholders=False):
+    if not raw.startswith(b"SQLite format 3"):
+        return False, "That file is not a SQLite database (expected the old wbc.db)."
+    init_db()
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = f"{DB_PATH}.bak_{stamp}"
+    shutil.copy2(DB_PATH, backup)
+    tmp = os.path.join(tempfile.gettempdir(), f"wbc_import_{stamp}.db")
+    with open(tmp, "wb") as fh:
+        fh.write(raw)
+    conn = sqlite3.connect(DB_PATH)
+    report = []
+    try:
+        conn.execute("ATTACH DATABASE ? AS old", (tmp,))
+        for table, (key, dedupe) in IMPORT_TABLES.items():
+            if not conn.execute("SELECT 1 FROM old.sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                continue
+            new_cols = [r[1] for r in conn.execute(f"PRAGMA main.table_info({table})")]
+            old_cols = {r[1] for r in conn.execute(f"PRAGMA old.table_info({table})")}
+            cols = [c for c in new_cols if c in old_cols and not (key is None and c == "id")]
+            if not cols:
+                continue
+            col_sql = ",".join(f'"{c}"' for c in cols)
+            sel_sql = ",".join(f'o."{c}"' for c in cols)
+            if replace:
+                conn.execute(f"DELETE FROM main.{table}")
+            if key:                                              # same key -> old (accurate) row wins
+                cur = conn.execute(f"INSERT OR REPLACE INTO main.{table} ({col_sql}) SELECT {sel_sql} FROM old.{table} o")
+            elif dedupe:
+                cur = conn.execute(f"INSERT INTO main.{table} ({col_sql}) SELECT {sel_sql} FROM old.{table} o "
+                                   f"WHERE NOT EXISTS (SELECT 1 FROM main.{table} m WHERE {dedupe})")
+            else:
+                cur = conn.execute(f"INSERT OR IGNORE INTO main.{table} ({col_sql}) SELECT {sel_sql} FROM old.{table} o")
+            report.append(f"{table}: {cur.rowcount}")
+        removed = 0
+        if drop_roster_placeholders and not replace:
+            cur = conn.execute("DELETE FROM main.cases WHERE id LIKE 'CASE-%' AND status IN ('Open','In Progress') "
+                               "AND id NOT IN (SELECT id FROM old.cases)")
+            removed = cur.rowcount
+        conn.execute("INSERT OR REPLACE INTO main.settings (key, value) VALUES ('excel_imported', 'old-db-import')")
+        conn.commit()
+        conn.execute("DETACH DATABASE old")
+    except Exception as e:
+        conn.rollback()
+        return False, f"Import failed, nothing changed: {e}  (backup: {backup})"
+    finally:
+        conn.close()
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    msg = "Imported - " + ", ".join(report) if report else "Imported - no matching tables found in that file."
+    if removed:
+        msg += f", removed {removed} untouched roster placeholder cases"
+    return True, msg + f".  Backup of the previous database: {os.path.basename(backup)}"
+
+
+# ----------------------------------------------------------------
+# DWD SYNC  (ported from the old /api/sync/dwd)
+# ----------------------------------------------------------------
+def yesterday_ast():
+    ast = datetime.timezone(datetime.timedelta(hours=4))
+    return (datetime.datetime.now(ast) - datetime.timedelta(days=1)).date()
+
+
+def run_dwd_sync(csv_text, date_str, sites):
+    done_key = f"dwd_sync_{date_str}"
+    if query("SELECT 1 FROM settings WHERE key=?", (done_key,)):
+        return False, f"{date_str} has already been synced - running it twice would double-count UPL days."
+    raw_rows = list(csv.DictReader(io.StringIO(csv_text)))
+    rows = [{(k or "").strip().lower(): (v or "").strip() for k, v in r.items()} for r in raw_rows]
+    if not rows:
+        return False, "The CSV is empty."
+    if "login" not in rows[0] or "absent" not in rows[0]:
+        return False, "The CSV needs at least the columns: login, absent (also site, empid, name, agency, shift, mgr)."
+
+    absent = []
+    for r in rows:
+        if r.get("absent", "") != "1":
+            continue
+        site = r.get("site", "")
+        if sites and site not in sites:
+            continue
+        absent.append({"login": r.get("login", "").lower(), "empid": r.get("empid", ""), "name": r.get("name", ""),
+                       "site": site, "agency": r.get("agency", "") or "Amazon", "shift": r.get("shift", ""),
+                       "mgr": r.get("mgr", ""), "date": date_str})
+
+    db = get_db()
+    created = skipped = 0
+    try:
+        for emp in absent:
+            short = hashlib.md5((emp["login"] + "|" + emp["date"]).encode()).hexdigest()[:8].upper()
+            if db.execute("SELECT id FROM cases WHERE login=? AND absent=?", (emp["login"], emp["date"])).fetchone():
+                skipped += 1
+                continue
+            db.execute("INSERT OR IGNORE INTO cases (id,login,empid,name,site,agency,shift,mgr,absent,created,source) "
+                       "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                       ("WBC-AUTO-" + short, emp["login"], emp["empid"], emp["name"], emp["site"], emp["agency"],
+                        emp["shift"], emp["mgr"], emp["date"], emp["date"], "dwd_sync"))
+            created += 1
+        for r in rows:                                           # UPL summary: +1 scheduled day per row (as before)
+            lg = r.get("login", "").lower()
+            if not lg:
+                continue
+            is_abs = 1 if r.get("absent", "") == "1" else 0
+            if db.execute("SELECT 1 FROM upl_summary WHERE login=?", (lg,)).fetchone():
+                db.execute("UPDATE upl_summary SET scheduled_days=scheduled_days+1, upl_days=upl_days+?, updated=? WHERE login=?",
+                           (is_abs, date_str, lg))
+            else:
+                db.execute("INSERT INTO upl_summary (login,site,scheduled_days,upl_days,updated) VALUES (?,?,1,?,?)",
+                           (lg, r.get("site", ""), is_abs, date_str))
+        db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (done_key, datetime.datetime.now().isoformat()))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        return False, f"Sync failed, nothing saved: {e}"
+    finally:
+        db.close()
+    return True, f"{date_str}: {created} new cases created, {skipped} already existed ({len(absent)} absent in selected sites)."
+
+
+# ----------------------------------------------------------------
 # UI BUILDING BLOCKS
 # ----------------------------------------------------------------
 def current():
@@ -451,8 +750,7 @@ def set_page(p):
 
 
 # ----------------------------------------------------------------
-# CASE WORKFLOW  (ported from the old portal: remarks, authorized / unauthorized,
-# escalation, warning letter, verbatim)
+# CASE WORKFLOW  (remarks, authorized / unauthorized, escalation, warning letter, verbatim)
 # ----------------------------------------------------------------
 def ua_status(dates, today=None):
     """Offence chain: an offence counts only if the previous one is within 90 days."""
@@ -520,7 +818,7 @@ def close_case(case, user, label, remarks, doc_type, up, override):
     today = str(datetime.date.today())
     esc_level, esc_action, valid_until, needs_doc = "", "", "", outcome not in NO_DOC
     if outcome == "Unauthorized":
-        if override and user["role"] in ADMIN_ROLES:
+        if override and is_admin_role(user):
             lvl = int(override)
         else:
             lvl = next_escalation(case["login"])[0]
@@ -692,7 +990,7 @@ def case_dialog(case_id):
     override, show_doc, doc_default = "", label not in NO_DOC, ""
     if label == "Unauthorized":
         lvl, action, valid = next_escalation(c["login"])
-        if user["role"] in ADMIN_ROLES:
+        if is_admin_role(user):
             override = st.selectbox("HRBP override (optional)", ["", "1", "2", "3", "4", "5", "6"],
                                     format_func=lambda v: "— Keep auto level —" if not v else f"L{v} — {UAL[int(v)]}",
                                     key=f"override_{case_id}")
@@ -734,14 +1032,14 @@ def case_dialog(case_id):
             st.error(msg)
 
 
-def cases_table(view):
+def cases_table(view, page_size=PAGE_SIZE):
     """Styled table with real 'View' buttons + pagination."""
     total = len(view)
-    pages = max(1, math.ceil(total / PAGE_SIZE))
+    pages = max(1, math.ceil(total / page_size))
     cur = min(max(1, st.session_state.get("cases_page", 1)), pages)
     st.session_state.cases_page = cur
-    start = (cur - 1) * PAGE_SIZE
-    chunk = view.iloc[start:start + PAGE_SIZE]
+    start = (cur - 1) * page_size
+    chunk = view.iloc[start:start + page_size]
     widths = [1.7, 0.9, 1.4, 1.2, 1.3, 0.9, 0.9]
 
     with st.container(key="thead_cases"):
@@ -766,7 +1064,7 @@ def cases_table(view):
                     if st.button("👁 View", key=f"viewbtn_{cur}_{n}"):
                         open_case(r["id"])
 
-    first, last = (start + 1 if total else 0), min(start + PAGE_SIZE, total)
+    first, last = (start + 1 if total else 0), min(start + page_size, total)
     with st.container(key="pager"):
         w0 = max(1, min(cur - 2, pages - 4))
         nums = list(range(w0, min(pages, w0 + 4) + 1))
@@ -798,30 +1096,44 @@ def page_dashboard():
     left, right = st.columns([2.35, 1], gap="medium")
     with left:
         with st.container(border=True, key="card_recent"):
-            h1, h2, h3 = st.columns([2.0, 2.3, 1.2], vertical_alignment="center")
+            h1, h2 = st.columns([1.6, 2.4], vertical_alignment="center")
             h1.markdown(card_header_html("check", "Recent Cases", "Latest cases across all sites"), unsafe_allow_html=True)
-            search = h2.text_input("Search", placeholder="Search by Case ID, Site, Type...",
+            search = h2.text_input("Search", placeholder="Search by Case ID, Site, Type, Name, Login...",
                                    label_visibility="collapsed", key="q_search")
-            sites = ["All Sites"] + sorted(s for s in df["site"].unique() if s)
-            site = h3.selectbox("Site", sites, label_visibility="collapsed", key="q_site")
 
-            view = df
-            if site != "All Sites":
-                view = view[view["site"] == site]
+            f1, f2, f3, f4 = st.columns([1, 0.8, 1.3, 0.9])
+            view = site_filters(df, "dash", [f1, f2, f3])
+            size = int(f4.selectbox("Rows per page", [8, 25, 50, 100, 200], key="q_size",
+                                    format_func=lambda n: f"{n} / page", label_visibility="collapsed"))
+
             if search.strip():
                 s = search.strip().lower()
                 hay = (view["id"] + " " + view["site"] + " " + view["_type"] + " " + view["name"] + " " + view["login"]).str.lower()
                 view = view[hay.str.contains(s, regex=False)]
-            sig = (search, site)
+
+            bar1, bar2, bar3 = st.columns([3, 1, 1], vertical_alignment="center")
+            bar1.markdown(f'<div class="showing">{len(view)} cases match - downloads include all of them, not just this page</div>',
+                          unsafe_allow_html=True)
+            export = view[CASE_COLS]
+            bar2.download_button("⬇ CSV", export.to_csv(index=False).encode(), "wbc_cases.csv", "text/csv",
+                                 key="dl_csv_dash", use_container_width=True)
+            xl = to_excel_bytes(export)
+            if xl:
+                bar3.download_button("⬇ Excel", xl, "wbc_cases.xlsx",
+                                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                     key="dl_xlsx_dash", use_container_width=True)
+
+            sig = (search, tuple(st.session_state.get(f"dash_{k}") for k in ("country", "bu", "site")), size)
             if st.session_state.get("_sig") != sig:
                 st.session_state["_sig"] = sig
                 st.session_state.cases_page = 1
-            cases_table(view)
+            cases_table(view, size)
 
     with right:
         with st.container(border=True, key="card_sites"):
             st.markdown(card_header_html("pin", "Cases by Site", "Total cases at each site"), unsafe_allow_html=True)
-            st.markdown(sites_html(df), unsafe_allow_html=True)
+            show_empty = st.checkbox("Include sites with no cases", key="sites_empty")
+            st.markdown(sites_html(df, show_empty), unsafe_allow_html=True)
 
 
 def page_cases():
@@ -832,15 +1144,11 @@ def page_cases():
         ("Active Sites", df.loc[df["site"] != "", "site"].nunique()),
         ("System Status", "Operational")]), unsafe_allow_html=True)
     with st.container(border=True, key="card_cases"):
-        a, b, c = st.columns([2.4, 1.3, 1.3], vertical_alignment="center")
-        a.markdown(card_header_html("list", "All Cases", "Filter and export the full case list"), unsafe_allow_html=True)
-        site = b.selectbox("Site", ["All Sites"] + sorted(s for s in df["site"].unique() if s),
-                           label_visibility="collapsed", key="cd_site")
-        status = c.selectbox("Status", ["All Status", "Open", "In Review / Pending", "Closed"],
+        st.markdown(card_header_html("list", "All Cases", "Filter and export the full case list"), unsafe_allow_html=True)
+        a, b, c, d = st.columns([1, 0.8, 1.3, 1.2])
+        view = site_filters(df, "cd", [a, b, c])
+        status = d.selectbox("Status", ["All Status", "Open", "In Review / Pending", "Closed"],
                              label_visibility="collapsed", key="cd_status")
-        view = df
-        if site != "All Sites":
-            view = view[view["site"] == site]
         if status == "Open":
             view = view[view["_g"] == "open"]
         elif status == "Closed":
@@ -852,7 +1160,14 @@ def page_cases():
             st.info("No records found matching your selected criteria.")
         else:
             st.dataframe(out, use_container_width=True, height=440, hide_index=True)
-            st.download_button("⬇ Export CSV", out.to_csv(index=False).encode(), "wbc_cases.csv", "text/csv")
+            d1, d2, _ = st.columns([1, 1, 4])
+            d1.download_button("⬇ Export CSV", out.to_csv(index=False).encode(), "wbc_cases.csv", "text/csv",
+                               key="dl_csv_cases", use_container_width=True)
+            xl = to_excel_bytes(out)
+            if xl:
+                d2.download_button("⬇ Export Excel", xl, "wbc_cases.xlsx",
+                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   key="dl_xlsx_cases", use_container_width=True)
 
 
 def table_page(title, sub, icon, card_title, card_sub, sql, chips, empty_msg, key):
@@ -867,6 +1182,8 @@ def table_page(title, sub, icon, card_title, card_sub, sql, chips, empty_msg, ke
             st.info(empty_msg)
         else:
             st.dataframe(data, use_container_width=True, height=440, hide_index=True)
+            st.download_button("⬇ Export CSV", data.to_csv(index=False).encode(), f"{key}.csv", "text/csv",
+                               key=f"dl_{key}")
 
 
 def ua_chips(d):
@@ -895,10 +1212,30 @@ def page_upl():
                upl_chips, "No UPL summary data available.", "upl")
 
 
+def page_sync():
+    user = current()
+    page_shell("DWD Sync", "Create absence cases from the daily DWD CSV (same logic as the old portal).")
+    if not is_all_access(user):
+        st.error("Access Denied: only Admin / VPOC / PXT can run the DWD sync.")
+        return
+    with st.container(border=True, key="card_sync"):
+        st.markdown(card_header_html("list", "Upload DWD CSV",
+                                     "Columns: login, empid, name, site, agency, shift, mgr, absent (1 = absent)"),
+                    unsafe_allow_html=True)
+        c1, c2 = st.columns([1, 2])
+        d = c1.date_input("Absence date", value=yesterday_ast(), key="sync_date")
+        pool = sorted(set(TARGET_SITES) | set(site_meta(get_site_map())))
+        sites = c2.multiselect("Sites to include", pool, default=TARGET_SITES, key="sync_sites")
+        up = st.file_uploader("DWD CSV", type=["csv"], key="sync_csv")
+        if st.button("Run sync", type="primary", disabled=up is None, key="sync_run"):
+            ok, msg = run_dwd_sync(up.getvalue().decode("utf-8-sig", errors="replace"), str(d), sites)
+            (st.success if ok else st.error)(msg)
+
+
 def page_users():
     user = current()
     page_shell("User Management", "Manage administrative users, roles, and facility permissions.")
-    if user["role"] != "Admin":
+    if not is_admin(user):
         st.error("Access Denied: Admin privileges required to view users.")
         return
     data = read_table("SELECT alias, role, sites, added, token FROM users")
@@ -906,16 +1243,75 @@ def page_users():
         st.markdown(card_header_html("user", "Portal Users", "Roles and facility permissions"), unsafe_allow_html=True)
         st.dataframe(data, use_container_width=True, height=380, hide_index=True)
 
+    with st.container(border=True, key="card_sitesadmin"):
+        st.markdown(card_header_html("pin", "Manage Sites", "Add a site to the Country / BU / Site selector"),
+                    unsafe_allow_html=True)
+        a, b, c, d = st.columns([1, 1, 1, 0.7], vertical_alignment="bottom")
+        country = a.selectbox("Country", list(SITE_MAP_DEFAULT), key="ns_country",
+                              format_func=lambda x: f"{COUNTRY_FLAGS.get(x, '')} {COUNTRY_LABELS.get(x, x)}")
+        bu = b.selectbox("BU", ["FC/SC", "AMZL"], key="ns_bu")
+        site = c.text_input("Site code", placeholder="e.g. DXB9", key="ns_site").strip().upper()
+        if d.button("Add site", key="ns_add", disabled=not site):
+            execute("INSERT OR IGNORE INTO custom_sites (country,bu,site,active,added_by,added_at) VALUES (?,?,?,1,?,?)",
+                    (country, bu, site, user["alias"], str(datetime.date.today())))
+            execute("UPDATE custom_sites SET active=1 WHERE country=? AND bu=? AND site=?", (country, bu, site))
+            st.session_state["_flash"] = f"{site} added."
+            st.rerun()
+        custom = query("SELECT id, country, bu, site FROM custom_sites WHERE active=1 ORDER BY country, bu, site")
+        for r in custom:
+            x, y = st.columns([5, 1], vertical_alignment="center")
+            x.markdown(f'<div class="td">{COUNTRY_FLAGS.get(r["country"], "")} {esc(r["country"])} · {esc(r["bu"])} · <b>{esc(r["site"])}</b></div>',
+                       unsafe_allow_html=True)
+            if y.button("Remove", key=f"rm_site_{r['id']}"):
+                execute("UPDATE custom_sites SET active=0 WHERE id=?", (r["id"],))
+                st.rerun()
+        if not custom:
+            st.caption("No custom sites yet - the built-in site list (UAE, Egypt, KSA, Turkiye) is always available.")
+
 
 def page_settings():
     user = current()
     page_shell("Settings", "Portal configuration, environment status, and system settings.")
+    db_path = os.path.abspath(DB_PATH)
+    exists = os.path.exists(db_path)
+    size_kb = os.path.getsize(db_path) / 1024 if exists else 0
+    modified = (datetime.datetime.fromtimestamp(os.path.getmtime(db_path)).strftime("%b %d, %Y %I:%M %p") if exists else "–")
+    counts = {t: query(f"SELECT COUNT(*) n FROM {t}")[0]["n"] for t in ("cases", "ua_offences", "upl_summary", "users")}
+    excel = [f for f in os.listdir(".") if f.lower().endswith((".xlsx", ".xls"))]
+    docs = f"S3 bucket: {S3_BUCKET}/{S3_PREFIX}" if S3_BUCKET else os.path.abspath(UPLOAD_DIR)
     with st.container(border=True, key="card_settings"):
         st.markdown(card_header_html("target", "System Status", "Environment and database"), unsafe_allow_html=True)
-        st.success("System is fully synchronized with the local database and excel repository.")
-        st.markdown(f'<div class="kv"><b>Database</b><span>{esc(os.path.abspath(DB_PATH))}</span>'
-                    f'<b>Signed in as</b><span>{esc(user["alias"])} ({esc(user["role"])})</span>'
-                    f'<b>Sites</b><span>{esc(user["sites"])}</span></div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="kv"><b>Database file</b><span>{esc(db_path)}</span>'
+            f'<b>DB size / modified</b><span>{size_kb:,.0f} KB / {esc(modified)}</span>'
+            f'<b>Records</b><span>{counts["cases"]} cases · {counts["ua_offences"]} UA offences · '
+            f'{counts["upl_summary"]} UPL rows · {counts["users"]} users</span>'
+            f'<b>Initial import from</b><span>{esc(excel[0]) if excel else "No Excel file found"}</span>'
+            f'<b>Documents saved in</b><span>{esc(docs)}</span>'
+            f'<b>Signed in as</b><span>{esc(user["alias"])} ({esc(user["role"])})</span>'
+            f'<b>Sites</b><span>{esc(user["sites"])}</span></div>', unsafe_allow_html=True)
+        st.warning("Cases are stored in a local SQLite file. On Streamlit Cloud this file is temporary and can be "
+                   "reset on reboot or redeploy, so download a backup regularly.")
+        if is_admin(user) and exists:
+            with open(db_path, "rb") as fh:
+                st.download_button("⬇ Download database backup (wbc.db)", fh.read(), "wbc.db",
+                                   "application/octet-stream", key="dl_db")
+
+    if is_admin(user):
+        with st.container(border=True, key="card_import"):
+            st.markdown(card_header_html("list", "Import old database",
+                                         "Bring cases, UA offences, UPL, users and sites over from the old portal's wbc.db"),
+                        unsafe_allow_html=True)
+            up = st.file_uploader("Old wbc.db", type=["db", "sqlite", "sqlite3"], key="imp_file")
+            mode = st.radio("Mode", ["Merge into current data (old rows win on the same ID)",
+                                     "Replace everything with the old database"], key="imp_mode")
+            replace = mode.startswith("Replace")
+            drop = st.checkbox("Also delete untouched roster placeholder cases (CASE-… still Open) that are not in the old database",
+                               key="imp_drop", disabled=replace)
+            st.caption("A timestamped backup of the current database is created first.")
+            if st.button("Import", type="primary", disabled=up is None, key="imp_run"):
+                ok, msg = import_old_db(up.getvalue(), replace=replace, drop_roster_placeholders=drop)
+                (st.success if ok else st.error)(msg)
 
 
 # ----------------------------------------------------------------
@@ -960,6 +1356,7 @@ def main():
         st.Page(page_cases, title="Cases Dashboard", icon=":material/table_chart:", url_path="cases"),
         st.Page(page_ua, title="UA Offences Tracker", icon=":material/shield:", url_path="ua-offences"),
         st.Page(page_upl, title="UPL Summary Analytics", icon=":material/bar_chart:", url_path="upl-summary"),
+        st.Page(page_sync, title="DWD Sync", icon=":material/sync:", url_path="dwd-sync"),
         st.Page(page_users, title="User Management", icon=":material/person:", url_path="users"),
         st.Page(page_settings, title="Settings", icon=":material/settings:", url_path="settings"),
     ]
