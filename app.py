@@ -24,182 +24,133 @@ CASE_COLS = ["id", "login", "empid", "name", "site", "mgr", "shift", "agency", "
 # ----------------------------------------------------------------
 # DESIGN SYSTEM  (CSS + SVG helpers)
 # ----------------------------------------------------------------
-def _ico(body):
-    return ("%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='black' "
-            "fill-rule='evenodd'%3E%3Cpath d='" + body + "'/%3E%3C/svg%3E")
-
-
-NAV_ICONS = [
-    _ico("M12 3 2 12h3v8h5v-6h4v6h5v-8h3z"),
-    _ico("M4 4h16a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm1 4v3h5V8zm7 0v3h7V8zm-7 5v3h5v-3zm7 0v3h7v-3z"),
-    _ico("M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5zm0 5 3 1.5v2.5c0 2.3-1.2 4.2-3 5.2-1.8-1-3-2.9-3-5.2V8.5z"),
-    _ico("M4 20V10h3v10zm6 0V4h3v16zm6 0v-7h3v7z"),
-    _ico("M12 12a5 5 0 1 0 0-10 5 5 0 0 0 0 10zm0 2c-4.4 0-8 2.2-8 5v3h16v-3c0-2.8-3.6-5-8-5z"),
-    _ico("M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm9.4 5.5v-3l-2.3-.5a7.6 7.6 0 0 0-.8-1.9l1.3-2-2.1-2.1-2 1.3a7.6 7.6 0 0 0-1.9-.8l-.5-2.3h-3l-.5 2.3a7.6 7.6 0 0 0-1.9.8l-2-1.3-2.1 2.1 1.3 2a7.6 7.6 0 0 0-.8 1.9l-2.3.5v3l2.3.5c.2.7.5 1.3.8 1.9l-1.3 2 2.1 2.1 2-1.3c.6.4 1.2.6 1.9.8l.5 2.3h3l.5-2.3c.7-.2 1.3-.5 1.9-.8l2 1.3 2.1-2.1-1.3-2c.4-.6.6-1.2.8-1.9z"),
-]
-
-_nav_css = "".join(
-    f'[data-testid="stSidebar"] [data-testid="stRadio"] label:nth-of-type({i + 1}) p'
-    f'{{--ico:url("data:image/svg+xml;utf8,{icon}");}}\n'
-    for i, icon in enumerate(NAV_ICONS))
-
 BASE_CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 :root{--navy:#0f1f4b;--blue:#2563eb;--muted:#64748b;--line:#e8edf5;}
+html{font-size:13.5px !important;}
 html, body, [data-testid="stAppViewContainer"], [data-testid="stSidebar"], button, input, textarea, select {
   font-family:'Inter','Segoe UI',system-ui,-apple-system,sans-serif !important; }
 [data-testid="stAppViewContainer"]{background:#f6f8fc;}
 [data-testid="stHeader"]{background:transparent;}
 [data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu, footer{display:none !important;}
-[data-testid="stMainBlockContainer"]{padding:0.6rem 1.8rem 2rem;max-width:100%;}
+[data-testid="stMainBlockContainer"]{padding:0.4rem 1.5rem 1.5rem;max-width:100%;}
 h1,h2,h3{color:var(--navy);}
 
 /* ---------- sidebar ---------- */
+[data-testid="stSidebarNav"]{display:none !important;}
 [data-testid="stSidebar"]{
   background:linear-gradient(180deg,#fff 0%,#fff 55%,#f2f1ff 80%,#e3e2ff 100%);
-  border-right:1px solid var(--line);min-width:262px !important;max-width:262px !important;}
-[data-testid="stSidebarHeader"]{min-height:0;height:auto;padding:.4rem 1rem 0;}
-[data-testid="stSidebarContent"]{padding:0 .9rem;}
-.brand{display:flex;align-items:center;gap:12px;padding:6px 6px 22px;}
-.brand b{display:block;font-size:1.3rem;font-weight:800;color:var(--navy);line-height:1.1;}
-.brand small{display:block;font-size:.64rem;color:var(--muted);margin-top:3px;white-space:nowrap;}
-[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"]{gap:4px;}
-[data-testid="stSidebar"] [data-testid="stRadio"] label{
-  width:100%;padding:12px;border-radius:10px;cursor:pointer;margin:0;}
-[data-testid="stSidebar"] [data-testid="stRadio"] label > div:first-child{display:none;}
-[data-testid="stSidebar"] [data-testid="stRadio"] label p{
-  display:flex;align-items:center;gap:12px;font-size:.9rem;font-weight:500;color:#475569;margin:0;white-space:nowrap;}
-[data-testid="stSidebar"] [data-testid="stRadio"] label p::before{
-  content:"";width:20px;height:20px;flex:none;background-color:currentColor;
-  -webkit-mask:var(--ico) center/contain no-repeat;mask:var(--ico) center/contain no-repeat;opacity:.75;}
-[data-testid="stSidebar"] [data-testid="stRadio"] label:hover{background:#f1f5fb;}
-[data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked){background:#e6eefd;}
-[data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) p{color:var(--blue);font-weight:600;}
-[data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) p::before{opacity:1;}
-.side-foot{position:fixed;left:26px;bottom:34px;font-size:1.02rem;line-height:1.35;font-weight:500;
+  border-right:1px solid var(--line);min-width:230px !important;max-width:230px !important;}
+[data-testid="stSidebarHeader"]{min-height:0;height:auto;padding:.3rem .8rem 0;}
+[data-testid="stSidebarContent"]{padding:0 .7rem;}
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"]{gap:.2rem;}
+.brand{display:flex;align-items:center;gap:10px;padding:4px 4px 16px;}
+.brand b{display:block;font-size:1.2rem;font-weight:800;color:var(--navy);line-height:1.1;}
+.brand small{display:block;font-size:.62rem;color:var(--muted);margin-top:3px;white-space:nowrap;}
+[data-testid="stSidebar"] [data-testid="stPageLink-NavLink"]{
+  padding:.55rem .75rem;border-radius:10px;gap:.7rem;color:#475569;font-weight:500;}
+[data-testid="stSidebar"] [data-testid="stPageLink-NavLink"]:hover{background:#f1f5fb;}
+[data-testid="stSidebar"] [data-testid="stPageLink-NavLink"] *{color:#475569;font-size:.9rem;white-space:nowrap;}
+[data-testid="stSidebar"] [data-testid="stPageLink-NavLink"][aria-current="page"]{background:#e6eefd;}
+[data-testid="stSidebar"] [data-testid="stPageLink-NavLink"][aria-current="page"] *{color:var(--blue);font-weight:600;}
+.side-foot{position:fixed;left:24px;bottom:28px;font-size:.95rem;line-height:1.35;font-weight:500;
   background:linear-gradient(90deg,#3b5bdb,#7c5cff);-webkit-background-clip:text;background-clip:text;color:transparent;}
-.side-foot span{display:block;width:30px;height:2px;margin-top:8px;background:#6366f1;border-radius:2px;}
+.side-foot span{display:block;width:28px;height:2px;margin-top:7px;background:#6366f1;border-radius:2px;}
 .st-key-signout button{background:transparent;border:1px solid var(--line);color:var(--muted);
-  border-radius:10px;font-size:.82rem;margin-top:14px;}
+  border-radius:10px;font-size:.8rem;margin-top:12px;}
 
 /* ---------- top bar ---------- */
-.topbar{display:flex;justify-content:space-between;align-items:center;margin:2px 0 14px;}
-.tb-left{display:flex;align-items:center;gap:12px;}
-.wave{font-size:1.8rem;}
-.tb-title{font-size:1.5rem;font-weight:800;color:var(--navy);line-height:1.15;}
-.tb-sub{font-size:.88rem;color:var(--muted);}
-.tb-right{display:flex;align-items:center;gap:22px;}
-.online{display:inline-flex;align-items:center;gap:8px;background:#e3f8ee;color:#059669;
-  font-size:.78rem;font-weight:600;padding:7px 14px;border-radius:999px;}
-.online i{width:8px;height:8px;border-radius:50%;background:#10b981;display:inline-block;}
-.tb-date{display:flex;align-items:center;gap:10px;font-size:.76rem;color:#475569;line-height:1.35;}
-.tb-date svg{color:#475569;}
-.tb-sep{width:1px;height:34px;background:var(--line);}
-.tb-user{display:flex;align-items:center;gap:10px;}
-.avatar{width:42px;height:42px;border-radius:50%;background:#dbe7ff;color:var(--blue);
+.topbar{display:flex;justify-content:space-between;align-items:center;margin:0 0 10px;}
+.tb-left{display:flex;align-items:center;gap:10px;}
+.wave{font-size:1.5rem;}
+.tb-title{font-size:1.3rem;font-weight:800;color:var(--navy);line-height:1.15;}
+.tb-sub{font-size:.8rem;color:var(--muted);}
+.tb-right{display:flex;align-items:center;gap:18px;}
+.online{display:inline-flex;align-items:center;gap:7px;background:#e3f8ee;color:#059669;
+  font-size:.72rem;font-weight:600;padding:6px 12px;border-radius:999px;}
+.online i{width:7px;height:7px;border-radius:50%;background:#10b981;display:inline-block;}
+.tb-date{display:flex;align-items:center;gap:8px;font-size:.72rem;color:#475569;line-height:1.35;}
+.tb-sep{width:1px;height:30px;background:var(--line);}
+.tb-user{display:flex;align-items:center;gap:9px;}
+.avatar{width:36px;height:36px;border-radius:50%;background:#dbe7ff;color:var(--blue);
   display:flex;align-items:center;justify-content:center;}
-.tb-user b{display:block;font-size:.88rem;color:var(--navy);}
-.tb-user small{display:block;font-size:.72rem;color:var(--muted);}
+.tb-user b{display:block;font-size:.82rem;color:var(--navy);}
+.tb-user small{display:block;font-size:.68rem;color:var(--muted);}
 
-/* ---------- hero ---------- */
-.hero{position:relative;overflow:hidden;border-radius:16px;padding:30px 32px;margin-bottom:16px;min-height:140px;
-  background:linear-gradient(100deg,#eef4ff 0%,#f1f0ff 55%,#e6e4ff 100%);border:1px solid #e6ecf8;}
-.hero::before{content:"";position:absolute;right:-60px;bottom:-90px;width:520px;height:220px;border-radius:50%;
-  background:radial-gradient(closest-side,rgba(165,150,255,.35),rgba(165,150,255,0));}
-.hero-pill{display:inline-block;background:#dbe8ff;color:var(--blue);font-size:.78rem;font-weight:600;
-  padding:4px 14px;border-radius:999px;}
-.hero-title{font-size:1.9rem;font-weight:800;color:var(--navy);margin:10px 0 4px;}
-.hero-sub{font-size:.92rem;color:var(--muted);}
-.hero-art{position:absolute;right:46px;top:14px;}
-
-/* ---------- KPI cards ---------- */
-.kpi{background:#fff;border:1px solid var(--line);border-bottom:3px solid var(--c);border-radius:14px;
-  padding:16px 16px 12px;box-shadow:0 2px 10px rgba(30,60,120,.05);box-sizing:border-box;}
-.kpi-top{display:flex;align-items:center;gap:12px;}
-.kpi-ico{width:46px;height:46px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex:none;}
-.kpi-mid{flex:1;min-width:0;}
-.kpi-label{font-size:.82rem;font-weight:600;color:#1e293b;white-space:nowrap;}
-.kpi-val{font-size:2rem;font-weight:800;color:var(--navy);line-height:1.15;}
-.kpi-val.sm{font-size:1.35rem;padding:6px 0;}
-.kpi-row{display:flex;align-items:flex-end;justify-content:space-between;gap:8px;}
-.kpi-spark{width:84px;flex:none;margin-bottom:2px;}
-.kpi-delta{margin-top:8px;font-size:.72rem;color:var(--muted);display:flex;align-items:center;gap:8px;}
-.kpi-delta em{font-style:normal;}
-.d-up{color:#059669;background:#e3f8ee;padding:1px 7px;border-radius:6px;font-weight:600;}
-.d-down{color:#e11d48;background:#ffe8ea;padding:1px 7px;border-radius:6px;font-weight:600;}
-.d-flat{color:#64748b;background:#eef2f7;padding:1px 7px;border-radius:6px;font-weight:600;}
+/* ---------- stat chips (replace the 5 KPI boxes) ---------- */
+.chips{display:flex;flex-wrap:wrap;gap:9px;margin:2px 0 14px;}
+.chip{display:inline-flex;align-items:center;gap:8px;padding:7px 13px;border-radius:10px;color:#fff;
+  font-size:.78rem;font-weight:600;background:linear-gradient(135deg,#9a88f7,#7b6be8);
+  box-shadow:0 4px 12px rgba(123,107,232,.26);}
+.chip b{background:rgba(255,255,255,.24);padding:1px 9px;border-radius:7px;font-size:.8rem;font-weight:700;}
 
 /* ---------- cards ---------- */
 [class*="st-key-card_"]{background:#fff;border:1px solid var(--line) !important;border-radius:14px !important;
-  box-shadow:0 2px 10px rgba(30,60,120,.05);padding:10px 14px 14px;}
-.card-h{display:flex;align-items:center;gap:12px;}
-.card-ico{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+  box-shadow:0 2px 10px rgba(30,60,120,.05);padding:8px 12px 12px;}
+.card-h{display:flex;align-items:center;gap:10px;}
+.card-ico{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;
   background:#e3edff;color:var(--blue);flex:none;}
-.card-t{font-size:1rem;font-weight:700;color:var(--navy);line-height:1.2;}
-.card-s{font-size:.78rem;color:var(--muted);}
+.card-t{font-size:.92rem;font-weight:700;color:var(--navy);line-height:1.2;}
+.card-s{font-size:.72rem;color:var(--muted);}
 [class*="st-key-card_"] [data-testid="stTextInput"] input,
-[class*="st-key-card_"] [data-baseweb="select"] > div{border-radius:10px;border-color:#dfe6f1;font-size:.82rem;}
+[class*="st-key-card_"] [data-baseweb="select"] > div{border-radius:10px;border-color:#dfe6f1;font-size:.8rem;min-height:36px;}
 
 /* ---------- case table ---------- */
-[class*="st-key-thead_"]{background:#f4f6fb;border-radius:8px;padding:10px 12px;margin-top:6px;gap:0;}
-[class*="st-key-row_"]{border-bottom:1px solid #eef2f7;padding:8px 12px;gap:0;}
+[class*="st-key-thead_"]{background:#f4f6fb;border-radius:8px;padding:8px 10px;margin-top:4px;gap:0;}
+[class*="st-key-row_"]{border-bottom:1px solid #eef2f7;padding:5px 10px;gap:0;}
 [class*="st-key-row_"]:hover{background:#fafcff;}
 [class*="st-key-thead_"] [data-testid="stHorizontalBlock"],
-[class*="st-key-row_"] [data-testid="stHorizontalBlock"]{align-items:center;gap:.5rem;}
-.th{font-size:.76rem;font-weight:600;color:#475569;}
-.td{font-size:.84rem;color:#334155;}
-.td.id{color:#1e293b;font-weight:500;}
-.pill{display:inline-block;padding:4px 16px;border-radius:999px;font-size:.76rem;font-weight:600;}
+[class*="st-key-row_"] [data-testid="stHorizontalBlock"]{align-items:center;gap:.4rem;}
+.th{font-size:.72rem;font-weight:600;color:#475569;}
+.td{font-size:.78rem;color:#334155;}
+.td.id{color:#1e293b;font-weight:500;white-space:nowrap;}
+.pill{display:inline-block;padding:3px 13px;border-radius:999px;font-size:.72rem;font-weight:600;}
 .p-open{background:#ffe8ea;color:#e11d48;}
 .p-review{background:#fff1d6;color:#d97706;}
 .p-closed{background:#d9f7ea;color:#059669;}
 .p-pending{background:#ece8ff;color:#7c3aed;}
 .p-other{background:#eef2f7;color:#475569;}
 [class*="st-key-view_"] button{border:none;background:transparent;color:var(--blue);font-weight:600;
-  font-size:.84rem;padding:0;min-height:0;box-shadow:none;}
+  font-size:.78rem;padding:0;min-height:0;box-shadow:none;}
 [class*="st-key-view_"] button:hover{background:transparent;color:#1d4ed8;}
-.showing{font-size:.78rem;color:var(--muted);padding-top:8px;}
-[class*="st-key-pager"] button{min-height:34px;padding:0 6px;border-radius:8px;border:1px solid #dfe6f1;
-  background:#fff;color:#475569;font-size:.8rem;}
+.showing{font-size:.74rem;color:var(--muted);padding-top:6px;}
+[class*="st-key-pager"] button{min-height:30px;padding:0 6px;border-radius:8px;border:1px solid #dfe6f1;
+  background:#fff;color:#475569;font-size:.76rem;}
 [class*="st-key-pager"] button[data-testid="stBaseButton-primary"]{background:var(--blue);border-color:var(--blue);color:#fff;}
 
 /* ---------- cases by site ---------- */
-.site-row{display:grid;grid-template-columns:86px 1fr 52px;align-items:center;gap:10px;
-  padding:14px 0;border-bottom:1px solid #f0f3f8;}
+.site-row{display:grid;grid-template-columns:70px 1fr 46px;align-items:center;gap:8px;
+  padding:11px 0;border-bottom:1px solid #f0f3f8;}
 .site-row:last-child{border-bottom:none;}
-.site-l{display:flex;align-items:center;gap:10px;font-size:.88rem;font-weight:600;color:#1e293b;}
-.site-l i{width:9px;height:9px;border-radius:50%;display:inline-block;flex:none;}
-.site-n{font-size:.88rem;font-weight:600;color:#1e293b;}
-.bar{height:7px;background:#eef2f9;border-radius:99px;overflow:hidden;margin-top:4px;}
+.site-l{display:flex;align-items:center;gap:8px;font-size:.8rem;font-weight:600;color:#1e293b;}
+.site-l i{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none;}
+.site-n{font-size:.8rem;font-weight:600;color:#1e293b;}
+.bar{height:6px;background:#eef2f9;border-radius:99px;overflow:hidden;margin-top:3px;}
 .bar span{display:block;height:100%;border-radius:99px;}
-.site-p{font-size:.74rem;color:var(--muted);text-align:right;}
+.site-p{font-size:.7rem;color:var(--muted);text-align:right;}
 
 /* ---------- dialog ---------- */
-.kv{display:grid;grid-template-columns:140px 1fr;gap:8px 12px;font-size:.88rem;}
+.kv{display:grid;grid-template-columns:130px 1fr;gap:7px 12px;font-size:.84rem;}
 .kv b{color:#475569;font-weight:600;}
 </style>
-""" + "<style>\n" + _nav_css + "</style>"
+"""
 
 LOGIN_CSS = """
 <style>
 [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"]{display:none !important;}
 [data-testid="stAppViewContainer"]{background:linear-gradient(135deg,#eaf1ff 0%,#f4f1ff 60%,#e6e4ff 100%);}
-.st-key-card_login{padding:26px 30px 28px;box-shadow:0 10px 40px rgba(37,99,235,.10);}
-.st-key-card_login .brand{justify-content:center;padding-bottom:6px;}
-.login-t{text-align:center;font-size:1.35rem;font-weight:800;color:#0f1f4b;margin:10px 0 2px;}
-.login-s{text-align:center;font-size:.85rem;color:#64748b;margin-bottom:10px;}
-.st-key-card_login button[data-testid="stBaseButton-secondary"]{background:#2563eb;color:#fff;border:none;
-  border-radius:10px;font-weight:600;min-height:42px;}
+.st-key-card_login{padding:22px 26px 24px;box-shadow:0 10px 40px rgba(37,99,235,.10);}
+.st-key-card_login .brand{justify-content:center;padding-bottom:4px;}
+.login-t{text-align:center;font-size:1.25rem;font-weight:800;color:#0f1f4b;margin:8px 0 2px;}
+.login-s{text-align:center;font-size:.8rem;color:#64748b;margin-bottom:8px;}
+.st-key-card_login button[data-testid="stBaseButton-secondary"]{background:#7b6be8;color:#fff;border:none;
+  border-radius:10px;font-weight:600;min-height:40px;}
 </style>
 """
 
 ICONS = {
-    "doc": '<path d="M7 3h7l5 5v13H7z"/><path d="M14 3v5h5M10 13h6M10 17h6"/>',
     "target": '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>',
-    "box": '<rect x="4" y="9" width="16" height="11" rx="2"/><path d="M4 13h16M12 9v11M8 9V6a2 2 0 0 1 4 0M16 9V6a2 2 0 0 0-4 0"/>',
-    "cube": '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/>',
-    "shieldclock": '<path d="M12 3l7 3v5c0 5-3 8.5-7 10-4-1.5-7-5-7-10V6z"/><path d="M12 8v4l3 2"/>',
     "pin": '<path d="M12 21s7-6.2 7-11a7 7 0 1 0-14 0c0 4.8 7 11 7 11z"/><circle cx="12" cy="10" r="2.5"/>',
     "check": '<rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8 12l3 3 5-6"/>',
     "cal": '<rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 10h16M9 3v4M15 3v4"/>',
@@ -215,7 +166,7 @@ def svg(name, size=22):
 
 BRAND_HTML = """
 <div class="brand">
-<svg width="40" height="44" viewBox="0 0 40 44"><defs><linearGradient id="bg1" x1="0" y1="0" x2="1" y2="1">
+<svg width="36" height="40" viewBox="0 0 40 44"><defs><linearGradient id="bg1" x1="0" y1="0" x2="1" y2="1">
 <stop offset="0" stop-color="#3b82f6"/><stop offset="1" stop-color="#1e3a8a"/></linearGradient></defs>
 <path d="M20 2 4 8v14c0 11 7 18 16 21 9-3 16-10 16-21V8z" fill="url(#bg1)"/>
 <path d="M20 10 10 14v8c0 7 4 11 10 14 6-3 10-7 10-14v-8z" fill="none" stroke="#fff" stroke-width="1.8" opacity=".7"/>
@@ -223,23 +174,20 @@ BRAND_HTML = """
 <div><b>WBC Portal</b><small>Workplace Behaviour &amp; Compliance</small></div></div>
 """
 
-HERO_ART = """
-<svg class="hero-art" width="230" height="130" viewBox="0 0 230 130">
-<defs><linearGradient id="ha" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f8faff"/><stop offset="1" stop-color="#dfe3ff"/></linearGradient>
-<linearGradient id="hs" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6aa0ff"/><stop offset="1" stop-color="#5b4be0"/></linearGradient></defs>
-<g transform="rotate(6 125 70)"><rect x="70" y="10" width="130" height="104" rx="10" fill="url(#ha)" stroke="#d3daf5"/>
-<rect x="86" y="30" width="62" height="7" rx="3.5" fill="#bcc8f2"/><rect x="86" y="48" width="86" height="7" rx="3.5" fill="#c9d3f5"/>
-<rect x="86" y="66" width="52" height="7" rx="3.5" fill="#d4dcf7"/></g>
-<path d="M172 54l26 10v20c0 16-11 26-26 31-15-5-26-15-26-31V64z" fill="url(#hs)"/>
-<path d="M162 86l8 8 15-17" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M58 30l-14-8M52 46l-18-2M60 14l-6-12" stroke="#4aa8ff" stroke-width="3" stroke-linecap="round"/></svg>
-"""
+SPARKLE = ('<svg width="14" height="14" viewBox="0 0 24 24" fill="#fff"><path d="M12 2l2.2 6.3L20.5 10l-6.3 2.2L12 18.5l'
+           '-2.2-6.3L3.5 10l6.3-1.7zM19 15l.9 2.4 2.4.9-2.4.9L19 21.6l-.9-2.4-2.4-.9 2.4-.9z"/></svg>')
 
 SITE_COLORS = ["#3b82f6", "#10b981", "#8b5cf6", "#f59e0b", "#06b6d4"]
 
 
 def esc(v):
     return _html.escape("" if v is None else str(v))
+
+
+def clean_id(v):
+    """Excel numbers arrive as '20808951.0' - hide the trailing .0."""
+    t = "" if v is None else str(v)
+    return t[:-2] if t.endswith(".0") else t
 
 
 def now_local():
@@ -250,69 +198,33 @@ def now_local():
         return datetime.datetime.now()
 
 
-def topbar_html(user):
+def topbar_html(user, title, sub, wave=False):
     n = now_local()
     role = {"Admin": "Administrator"}.get(user["role"], user["role"])
     name = user["alias"].capitalize()
+    w = '<span class="wave">👋</span>' if wave else ""
     return f"""
 <div class="topbar">
- <div class="tb-left"><span class="wave">👋</span>
-  <div><div class="tb-title">Welcome back, {esc(name)}</div>
-  <div class="tb-sub">Here's what's happening with your WBC Portal today.</div></div></div>
+ <div class="tb-left">{w}
+  <div><div class="tb-title">{esc(title)}</div><div class="tb-sub">{esc(sub)}</div></div></div>
  <div class="tb-right">
   <span class="online"><i></i>System Online</span>
-  <div class="tb-date">{svg('cal', 22)}<div>{n.strftime('%b %d, %Y')}<br>{n.strftime('%I:%M %p')}</div></div>
+  <div class="tb-date">{svg('cal', 20)}<div>{n.strftime('%b %d, %Y')}<br>{n.strftime('%I:%M %p')}</div></div>
   <span class="tb-sep"></span>
-  <div class="tb-user"><div class="avatar">{svg('user', 22)}</div>
+  <div class="tb-user"><div class="avatar">{svg('user', 20)}</div>
    <div><b>{esc(name)}</b><small>{esc(role)}</small></div></div>
  </div></div>"""
 
 
-def hero_html(pill, title, sub):
-    return (f'<div class="hero"><span class="hero-pill">{esc(pill)}</span>'
-            f'<div class="hero-title">{esc(title)}</div><div class="hero-sub">{esc(sub)}</div>'
-            f'{HERO_ART}</div>')
-
-
-def card_header_html(icon, title, sub, bg="#e3edff", fg="#2563eb"):
-    return (f'<div class="card-h"><div class="card-ico" style="background:{bg};color:{fg}">{svg(icon, 22)}</div>'
+def card_header_html(icon, title, sub):
+    return (f'<div class="card-h"><div class="card-ico">{svg(icon, 18)}</div>'
             f'<div><div class="card-t">{esc(title)}</div><div class="card-s">{esc(sub)}</div></div></div>')
 
 
-def spark_svg(values, color, uid):
-    w, h = 84, 36
-    mx = max(values) if values else 0
-    n = len(values)
-    if n < 2:
-        values, n = [0, 0], 2
-    pts = []
-    for i, v in enumerate(values):
-        x = i * (w - 2) / (n - 1) + 1
-        y = h - 4 - ((v / mx) * (h - 10) if mx else 0)
-        pts.append((x, y))
-    line = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
-    area = f"M{pts[0][0]:.1f},{h} L" + " L".join(f"{x:.1f},{y:.1f}" for x, y in pts) + f" L{pts[-1][0]:.1f},{h} Z"
-    return (f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}"><defs><linearGradient id="sp{uid}" x1="0" y1="0" x2="0" y2="1">'
-            f'<stop offset="0" stop-color="{color}" stop-opacity=".25"/><stop offset="1" stop-color="{color}" stop-opacity="0"/>'
-            f'</linearGradient></defs><path d="{area}" fill="url(#sp{uid})"/>'
-            f'<polyline points="{line}" fill="none" stroke="{color}" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></svg>')
-
-
-def delta_html(pct):
-    if pct is None:
-        return '<span class="d-flat">–</span><em>vs. last 30 days</em>'
-    cls, arrow = ("d-up", "↑") if pct >= 0 else ("d-down", "↓")
-    return f'<span class="{cls}">{arrow} {abs(pct):.0f}%</span><em>vs. last 30 days</em>'
-
-
-def kpi_html(label, value, color, soft, icon, spark=None, delta="", small=False, uid=0):
-    sp = f'<div class="kpi-spark">{spark_svg(spark, color, uid)}</div>' if spark is not None else ""
-    cls = "kpi-val sm" if small else "kpi-val"
-    return (f'<div class="kpi" style="--c:{color}"><div class="kpi-top">'
-            f'<div class="kpi-ico" style="background:{soft};color:{color}">{svg(icon, 24)}</div>'
-            f'<div class="kpi-mid"><div class="kpi-label">{esc(label)}</div>'
-            f'<div class="kpi-row"><div class="{cls}">{esc(value)}</div>{sp}</div></div>'
-            f'</div><div class="kpi-delta">{delta}</div></div>')
+def chips_html(items):
+    """Compact pill chips (label + number) - replaces the big KPI boxes."""
+    body = "".join(f'<div class="chip">{SPARKLE}<span>{esc(l)}</span><b>{esc(v)}</b></div>' for l, v in items)
+    return f'<div class="chips">{body}</div>'
 
 
 def pill_html(group, label):
@@ -322,7 +234,7 @@ def pill_html(group, label):
 
 def sites_html(df):
     if df.empty:
-        return '<div class="card-s" style="padding:18px 0">No data yet.</div>'
+        return '<div class="card-s" style="padding:16px 0">No data yet.</div>'
     counts = df["site"].fillna("").replace("", "Unassigned").value_counts().head(5)
     total, top = len(df), int(counts.max())
     rows = []
@@ -359,18 +271,6 @@ def prepare(df):
     df["_days"] = (end - df["_created"]).dt.days
     df["_type"] = df["outcome"].replace("", pd.NA).fillna("Attendance")
     return df
-
-
-def series_and_trend(df, mask):
-    sub = df[mask]
-    today = pd.Timestamp.today().normalize()
-    days = pd.date_range(today - pd.Timedelta(days=13), today)
-    per_day = sub["_created"].dt.normalize().value_counts()
-    vals = [int(per_day.get(d, 0)) for d in days]
-    cur = int(((sub["_created"] > today - pd.Timedelta(days=30)) & (sub["_created"] < today + pd.Timedelta(days=1))).sum())
-    prev = int(((sub["_created"] > today - pd.Timedelta(days=60)) & (sub["_created"] <= today - pd.Timedelta(days=30))).sum())
-    pct = None if prev == 0 else (cur - prev) / prev * 100
-    return vals, pct
 
 
 # ----------------------------------------------------------------
@@ -496,21 +396,25 @@ def read_table(sql):
 # ----------------------------------------------------------------
 # UI BUILDING BLOCKS
 # ----------------------------------------------------------------
-def page_shell(user, pill, title, sub):
-    st.markdown(topbar_html(user), unsafe_allow_html=True)
-    st.markdown(hero_html(pill, title, sub), unsafe_allow_html=True)
+def current():
+    return st.session_state["_user"]
+
+
+def page_shell(title, sub, wave=False):
+    st.markdown(topbar_html(current(), title, sub, wave), unsafe_allow_html=True)
 
 
 def set_page(p):
-    st.session_state.page = p
+    st.session_state.cases_page = p
 
 
 @st.dialog("Case details")
 def show_case(r):
-    rows = [("Case ID", r["id"]), ("Employee", r["name"]), ("Login", r["login"]), ("Employee ID", r["empid"]),
-            ("Site", r["site"]), ("Manager", r["mgr"]), ("Shift", r["shift"]), ("Agency", r["agency"]),
-            ("Attendance / absent", r["absent"]), ("Opened", r["created"]), ("Status", r["status"]),
-            ("Outcome", r["outcome"]), ("Reason", r["reason"]), ("Notes", r["notes"])]
+    rows = [("Case ID", clean_id(r["id"])), ("Employee", r["name"]), ("Login", r["login"]),
+            ("Employee ID", clean_id(r["empid"])), ("Site", r["site"]), ("Manager", r["mgr"]),
+            ("Shift", r["shift"]), ("Agency", r["agency"]), ("Attendance / absent", r["absent"]),
+            ("Opened", r["created"]), ("Status", r["status"]), ("Outcome", r["outcome"]),
+            ("Reason", r["reason"]), ("Notes", r["notes"])]
     body = "".join(f"<b>{esc(k)}</b><span>{esc(v) or '–'}</span>" for k, v in rows)
     st.markdown(f'<div class="kv">{body}</div>', unsafe_allow_html=True)
 
@@ -519,11 +423,11 @@ def cases_table(view):
     """Styled table with real 'View' buttons + pagination."""
     total = len(view)
     pages = max(1, math.ceil(total / PAGE_SIZE))
-    cur = min(max(1, st.session_state.get("page", 1)), pages)
-    st.session_state.page = cur
+    cur = min(max(1, st.session_state.get("cases_page", 1)), pages)
+    st.session_state.cases_page = cur
     start = (cur - 1) * PAGE_SIZE
     chunk = view.iloc[start:start + PAGE_SIZE]
-    widths = [1.3, 0.9, 1.5, 1.2, 1.3, 1.0, 1.0]
+    widths = [1.7, 0.9, 1.4, 1.2, 1.3, 0.9, 0.9]
 
     with st.container(key="thead_cases"):
         for col, t in zip(st.columns(widths), ["Case ID", "Site", "Type", "Status", "Opened Date", "Days Open", "Actions"]):
@@ -536,7 +440,7 @@ def cases_table(view):
         days = "–" if pd.isna(r["_days"]) else int(r["_days"])
         with st.container(key=f"row_{cur}_{n}"):
             c = st.columns(widths)
-            c[0].markdown(f'<div class="td id">{esc(r["id"])}</div>', unsafe_allow_html=True)
+            c[0].markdown(f'<div class="td id">{esc(clean_id(r["id"]))}</div>', unsafe_allow_html=True)
             c[1].markdown(f'<div class="td">{esc(r["site"])}</div>', unsafe_allow_html=True)
             c[2].markdown(f'<div class="td">{esc(r["_type"])}</div>', unsafe_allow_html=True)
             c[3].markdown(pill_html(r["_g"], r["status"] or "Open"), unsafe_allow_html=True)
@@ -544,7 +448,7 @@ def cases_table(view):
             c[5].markdown(f'<div class="td">{days}</div>', unsafe_allow_html=True)
             with c[6]:
                 with st.container(key=f"view_{cur}_{n}"):
-                    if st.button("👁  View", key=f"viewbtn_{cur}_{n}"):
+                    if st.button("👁 View", key=f"viewbtn_{cur}_{n}"):
                         show_case(r.to_dict())
 
     first, last = (start + 1 if total else 0), min(start + PAGE_SIZE, total)
@@ -563,29 +467,23 @@ def cases_table(view):
 # ----------------------------------------------------------------
 # PAGES
 # ----------------------------------------------------------------
-def page_dashboard(user, df):
-    page_shell(user, "Cases", "Cases Overview", "Track, manage and resolve workplace behaviour cases efficiently.")
+def page_dashboard():
+    user = current()
+    df = load_cases(user)
+    page_shell(f"Welcome back, {user['alias'].capitalize()}",
+               "Here's what's happening with your WBC Portal today.", wave=True)
 
     g = df["_g"]
     pending = ~g.isin(["open", "closed"])
-    defs = [
-        ("Total Cases", pd.Series(True, index=df.index), "#f43f5e", "#ffe4e8", "doc"),
-        ("Open Cases", g == "open", "#10b981", "#d9f7ea", "target"),
-        ("Closed Cases", g == "closed", "#3b82f6", "#dbeafe", "box"),
-        ("Pending Cases", pending, "#f59e0b", "#fef0d3", "cube"),
-        ("Pending > 5 Days", pending & (df["_days"] > 5), "#8b5cf6", "#ede9fe", "shieldclock"),
-    ]
-    for i, (col, (label, mask, color, soft, icon)) in enumerate(zip(st.columns(5), defs)):
-        vals, pct = series_and_trend(df, mask)
-        col.markdown(kpi_html(label, int(mask.sum()), color, soft, icon, vals, delta_html(pct), uid=i),
-                     unsafe_allow_html=True)
+    st.markdown(chips_html([
+        ("Total Cases", len(df)), ("Open Cases", int((g == "open").sum())),
+        ("Closed Cases", int((g == "closed").sum())), ("Pending Cases", int(pending.sum())),
+        ("Pending > 5 Days", int((pending & (df["_days"] > 5)).sum()))]), unsafe_allow_html=True)
 
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     left, right = st.columns([2.35, 1], gap="medium")
-
     with left:
         with st.container(border=True, key="card_recent"):
-            h1, h2, h3 = st.columns([2.1, 2.3, 1.2], vertical_alignment="center")
+            h1, h2, h3 = st.columns([2.0, 2.3, 1.2], vertical_alignment="center")
             h1.markdown(card_header_html("check", "Recent Cases", "Latest cases across all sites"), unsafe_allow_html=True)
             search = h2.text_input("Search", placeholder="Search by Case ID, Site, Type...",
                                    label_visibility="collapsed", key="q_search")
@@ -602,7 +500,7 @@ def page_dashboard(user, df):
             sig = (search, site)
             if st.session_state.get("_sig") != sig:
                 st.session_state["_sig"] = sig
-                st.session_state.page = 1
+                st.session_state.cases_page = 1
             cases_table(view)
 
     with right:
@@ -611,16 +509,13 @@ def page_dashboard(user, df):
             st.markdown(sites_html(df), unsafe_allow_html=True)
 
 
-def page_cases(user, df):
-    page_shell(user, "Cases", "Cases Dashboard",
-               "Real-time tracking of employee roster performance, attendance, and operational status.")
-    k = st.columns(3)
-    k[0].markdown(kpi_html("Total Records", len(df), "#f43f5e", "#ffe4e8", "doc", delta="Across all visible sites"), unsafe_allow_html=True)
-    k[1].markdown(kpi_html("Active Sites", df.loc[df["site"] != "", "site"].nunique(),
-                           "#3b82f6", "#dbeafe", "pin", delta="Sites with cases"), unsafe_allow_html=True)
-    k[2].markdown(kpi_html("System Status", "Operational", "#10b981", "#d9f7ea", "target", delta="All services running", small=True),
-                  unsafe_allow_html=True)
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+def page_cases():
+    df = load_cases(current())
+    page_shell("Cases Dashboard", "Real-time tracking of employee roster performance, attendance, and operational status.")
+    st.markdown(chips_html([
+        ("Total Records", len(df)),
+        ("Active Sites", df.loc[df["site"] != "", "site"].nunique()),
+        ("System Status", "Operational")]), unsafe_allow_html=True)
     with st.container(border=True, key="card_cases"):
         a, b, c = st.columns([2.4, 1.3, 1.3], vertical_alignment="center")
         a.markdown(card_header_html("list", "All Cases", "Filter and export the full case list"), unsafe_allow_html=True)
@@ -641,57 +536,65 @@ def page_cases(user, df):
         if out.empty:
             st.info("No records found matching your selected criteria.")
         else:
-            st.dataframe(out, use_container_width=True, height=470, hide_index=True)
+            st.dataframe(out, use_container_width=True, height=440, hide_index=True)
             st.download_button("⬇ Export CSV", out.to_csv(index=False).encode(), "wbc_cases.csv", "text/csv")
 
 
-def simple_table_page(user, pill, title, sub, icon, card_title, card_sub, sql, kpis, empty_msg):
-    page_shell(user, pill, title, sub)
+def table_page(title, sub, icon, card_title, card_sub, sql, chips, empty_msg, key):
+    page_shell(title, sub)
     data = read_table(sql)
-    cards = kpis(data)
-    if cards:
-        for col, html_ in zip(st.columns(len(cards)), cards):
-            col.markdown(html_, unsafe_allow_html=True)
-        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-    with st.container(border=True, key=f"card_{pill.lower().replace(' ', '')}"):
+    items = chips(data)
+    if items:
+        st.markdown(chips_html(items), unsafe_allow_html=True)
+    with st.container(border=True, key=f"card_{key}"):
         st.markdown(card_header_html(icon, card_title, card_sub), unsafe_allow_html=True)
         if data.empty:
             st.info(empty_msg)
         else:
-            st.dataframe(data, use_container_width=True, height=460, hide_index=True)
+            st.dataframe(data, use_container_width=True, height=440, hide_index=True)
 
 
-def ua_kpis(d):
+def ua_chips(d):
     if d.empty:
         return []
-    return [kpi_html("Total Offences", len(d), "#f43f5e", "#ffe4e8", "shieldclock", delta="All recorded offences"),
-            kpi_html("Employees", d["login"].nunique(), "#8b5cf6", "#ede9fe", "user", delta="Unique logins"),
-            kpi_html("Sites Affected", d["site"].nunique(), "#3b82f6", "#dbeafe", "pin", delta="Distinct sites")]
+    return [("Total Offences", len(d)), ("Employees", d["login"].nunique()), ("Sites Affected", d["site"].nunique())]
 
 
-def upl_kpis(d):
+def upl_chips(d):
     if d.empty:
         return []
     sched, upl = int(d["scheduled_days"].sum()), int(d["upl_days"].sum())
-    pct = f"{upl / sched * 100:.1f}%" if sched else "0%"
-    return [kpi_html("Employees Tracked", len(d), "#3b82f6", "#dbeafe", "user", delta="In UPL summary"),
-            kpi_html("Total UPL Days", upl, "#f59e0b", "#fef0d3", "cube", delta=f"of {sched} scheduled days"),
-            kpi_html("Overall UPL %", pct, "#8b5cf6", "#ede9fe", "shieldclock", delta="UPL / scheduled")]
+    return [("Employees Tracked", len(d)), ("Total UPL Days", upl),
+            ("Overall UPL %", f"{upl / sched * 100:.1f}%" if sched else "0%")]
 
 
-def page_users(user):
-    page_shell(user, "Access Control", "User Management", "Manage administrative users, roles, and facility permissions.")
+def page_ua():
+    table_page("UA Offences Tracker", "Comprehensive overview of recorded unauthorized absence offences.", "list",
+               "UA Offences", "Most recent offences first", "SELECT * FROM ua_offences ORDER BY date DESC",
+               ua_chips, "No UA offences recorded in the database.", "ua")
+
+
+def page_upl():
+    table_page("UPL Summary Analytics", "Unplanned leave and schedule performance summary.", "list",
+               "UPL Summary", "Unplanned leave per employee", "SELECT * FROM upl_summary ORDER BY updated DESC",
+               upl_chips, "No UPL summary data available.", "upl")
+
+
+def page_users():
+    user = current()
+    page_shell("User Management", "Manage administrative users, roles, and facility permissions.")
     if user["role"] != "Admin":
         st.error("Access Denied: Admin privileges required to view users.")
         return
     data = read_table("SELECT alias, role, sites, added, token FROM users")
     with st.container(border=True, key="card_users"):
         st.markdown(card_header_html("user", "Portal Users", "Roles and facility permissions"), unsafe_allow_html=True)
-        st.dataframe(data, use_container_width=True, height=400, hide_index=True)
+        st.dataframe(data, use_container_width=True, height=380, hide_index=True)
 
 
-def page_settings(user):
-    page_shell(user, "System", "Settings", "Portal configuration, environment status, and system settings.")
+def page_settings():
+    user = current()
+    page_shell("Settings", "Portal configuration, environment status, and system settings.")
     with st.container(border=True, key="card_settings"):
         st.markdown(card_header_html("target", "System Status", "Environment and database"), unsafe_allow_html=True)
         st.success("System is fully synchronized with the local database and excel repository.")
@@ -703,9 +606,6 @@ def page_settings(user):
 # ----------------------------------------------------------------
 # MAIN
 # ----------------------------------------------------------------
-NAV = ["Dashboard", "Cases Dashboard", "UA Offences Tracker", "UPL Summary Analytics", "User Management", "Settings"]
-
-
 def main():
     st.markdown(BASE_CSS, unsafe_allow_html=True)
     init_db()
@@ -737,10 +637,26 @@ def main():
                         st.error("Invalid alias. Please verify and try again.")
         st.stop()
 
-    # ---------- sidebar ----------
+    st.session_state["_user"] = user
+
+    # ---------- navigation ----------
+    pages = [
+        st.Page(page_dashboard, title="Dashboard", icon=":material/home:", url_path="dashboard", default=True),
+        st.Page(page_cases, title="Cases Dashboard", icon=":material/table_chart:", url_path="cases"),
+        st.Page(page_ua, title="UA Offences Tracker", icon=":material/shield:", url_path="ua-offences"),
+        st.Page(page_upl, title="UPL Summary Analytics", icon=":material/bar_chart:", url_path="upl-summary"),
+        st.Page(page_users, title="User Management", icon=":material/person:", url_path="users"),
+        st.Page(page_settings, title="Settings", icon=":material/settings:", url_path="settings"),
+    ]
+    try:
+        nav = st.navigation(pages, position="hidden")
+    except TypeError:           # older Streamlit: default nav is hidden by CSS instead
+        nav = st.navigation(pages)
+
     with st.sidebar:
         st.markdown(BRAND_HTML, unsafe_allow_html=True)
-        menu = st.radio("Navigation", NAV, label_visibility="collapsed", key="nav")
+        for p in pages:
+            st.page_link(p, label=p.title, icon=p.icon)
         with st.container(key="signout"):
             if st.button("Sign out", use_container_width=True):
                 st.session_state.clear()
@@ -748,27 +664,7 @@ def main():
                 st.rerun()
         st.markdown('<div class="side-foot">Better Workplace<br>Safer Tomorrow<span></span></div>', unsafe_allow_html=True)
 
-    # ---------- pages ----------
-    if menu == "Dashboard":
-        page_dashboard(user, load_cases(user))
-    elif menu == "Cases Dashboard":
-        page_cases(user, load_cases(user))
-    elif menu == "UA Offences Tracker":
-        simple_table_page(user, "Compliance", "UA Offences Tracker",
-                          "Comprehensive overview of recorded unauthorized absence offences.", "list",
-                          "UA Offences", "Most recent offences first",
-                          "SELECT * FROM ua_offences ORDER BY date DESC", ua_kpis,
-                          "No UA offences recorded in the database.")
-    elif menu == "UPL Summary Analytics":
-        simple_table_page(user, "Analytics", "UPL Summary Analytics",
-                          "Unplanned leave and schedule performance summary.", "list",
-                          "UPL Summary", "Unplanned leave per employee",
-                          "SELECT * FROM upl_summary ORDER BY updated DESC", upl_kpis,
-                          "No UPL summary data available.")
-    elif menu == "User Management":
-        page_users(user)
-    else:
-        page_settings(user)
+    nav.run()
 
 
 if __name__ == "__main__":
