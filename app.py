@@ -545,6 +545,9 @@ def load_cases(user):
             df[col] = ""
     df = df.fillna("")
     df = df[~df["absent"].astype(str).str.strip().str.upper().isin(EXCLUDED_ATTENDANCE)]
+    # planned leave (PL) is not an absence: PL rows that are not closed never show up as cases
+    is_pl = df["absent"].astype(str).str.strip().str.upper() == "PL"
+    df = df[~(is_pl & (df["status"].astype(str).str.strip().str.lower() != "closed"))]
     return prepare(df)
 
 
