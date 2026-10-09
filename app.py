@@ -42,26 +42,29 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_cases_site ON cases(site)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status)")
     
-    # FIXED ADMIN TOKEN: ab aap "admin123" use karke easily login ho sakte hain
-    fixed_token = "admin123"
-    c.execute("INSERT OR REPLACE INTO users (alias, role, sites, added, token) VALUES ('mnnafee', 'Admin', 'All', ?, ?)", 
-              (str(datetime.date.today()), fixed_token))
+    # Seed users cleanly so alias works directly
+    c.execute("INSERT OR REPLACE INTO users (alias, role, sites, added, token) VALUES ('mnnafee', 'Admin', 'All', ?, 'mnnafee')", 
+              (str(datetime.date.today()),))
+    c.execute("INSERT OR REPLACE INTO users (alias, role, sites, added, token) VALUES ('javmuhak', 'VPOC', 'All', ?, 'javmuhak')", 
+              (str(datetime.date.today()),))
+              
     conn.commit()
     conn.close()
 
 init_db()
 
 # ----------------------------------------------------------------
-# TOKEN AUTHENTICATION
+# AUTHENTICATION (Direct Alias Login)
 # ----------------------------------------------------------------
 if "token" not in st.session_state:
     st.session_state.token = ""
 
-def get_user_by_token(token):
-    if not token:
+def get_user_by_credential(val):
+    if not val:
         return None
     db = get_db()
-    row = db.execute('SELECT * FROM users WHERE token=?', (token,)).fetchone()
+    # Matches either token or exact alias name
+    row = db.execute('SELECT * FROM users WHERE token=? OR alias=?', (val.strip().lower(), val.strip().lower())).fetchone()
     db.close()
     return dict(row) if row else None
 
@@ -69,25 +72,25 @@ query_params = st.query_params
 if "token" in query_params and not st.session_state.token:
     st.session_state.token = query_params["token"]
 
-current_user = get_user_by_token(st.session_state.token)
+current_user = get_user_by_credential(st.session_state.token)
 
 # ----------------------------------------------------------------
 # LOGIN / ACCESS GATE UI
 # ----------------------------------------------------------------
 if not current_user:
     st.title("🔐 WBC Portal - Authentication")
-    st.markdown("Please enter your access token to continue.")
+    st.markdown("Apna alias likhein (mis ke taur par **javmuhak** ya **mnnafee**) aur login karein.")
     
-    # Yahan ab aap direct token enter kar sakte hain
-    input_token = st.text_input("Enter Token:", value="admin123", type="default")
+    input_val = st.text_input("Enter Alias:", value="javmuhak")
     if st.button("Login"):
-        user = get_user_by_token(input_token)
+        user = get_user_by_credential(input_val)
         if user:
-            st.session_state.token = input_token
-            st.success("Access granted!")
+            st.session_state.token = user['alias']
+            st.success(f"Khushamdid, {user['alias'].upper()}! Role: {user['role']}")
             st.rerun()
         else:
-            st.error("Invalid token.")
+            st.error("Invalid alias. Dobara check karein.")
+    
     st.stop()
 
 # ----------------------------------------------------------------
@@ -136,7 +139,7 @@ elif menu == "UPL Summary":
 elif menu == "User Management":
     st.header("👥 User Management & Access")
     if current_user['role'] != 'Admin':
-        st.error("Admin permission required.")
+        st.error("Admin permission required to view users.")
     else:
         users = db.execute('SELECT alias, role, sites, added, token FROM users').fetchall()
         st.dataframe([dict(u) for u in users], use_container_width=True)
