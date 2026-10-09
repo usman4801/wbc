@@ -26,9 +26,10 @@ TOP_N_SITES = 3                                                 # Cases by Site 
 
 UAL = ["", "Verbal Coaching", "Documented Coaching", "First Warning",
        "Second Warning", "Final Warning", "Termination"]
-REASONS = {"Sick Leave": "Sick Leave", "Authorized": "Authorized", "Unauthorized": "Unauthorized",
+REASONS = {"Sick Leave": "Sick Leave", "Authorized": "Authorized", "Authorized Unpaid": "Authorized Unpaid",
+           "Unauthorized": "Unauthorized",
            "Incorrect Entry on DWD": "Incorrect Entry on DWD", "Converted to PL": "Converted to PL"}
-NO_DOC = {"Incorrect Entry on DWD", "Converted to PL"}            # no document needed
+NO_DOC = {"Authorized", "Authorized Unpaid", "Incorrect Entry on DWD", "Converted to PL"}   # no upload shown
 OPTIONAL_DOC = {"Sick Leave"}                                     # upload offered, but case can be submitted without it
 UPL_REVERSING = {"Incorrect", "Incorrect Entry on DWD", "Converted to PL"}   # take a day off UPL
 DOC_TYPES = ["", "Medical Certificate", "HRBP Approval", "Warning Letter", "Email Approval", "Other"]
@@ -167,6 +168,17 @@ h1,h2,h3{color:var(--navy);}
 [class*="st-key-pager"] button{min-height:30px;padding:0 6px;border-radius:8px;border:1px solid #dfe6f1;
   background:#fff;color:#475569;font-size:.76rem;}
 [class*="st-key-pager"] button[data-testid="stBaseButton-primary"]{background:var(--blue);border-color:var(--blue);color:#fff;}
+
+/* ---------- CSV / Excel export buttons ---------- */
+[class*="st-key-dl_csv"] button, .st-key-dl_ua button, .st-key-dl_upl button{
+  background:#fff;border:1.5px solid #5b8def;color:#2563eb;border-radius:12px;font-weight:600;min-height:44px;}
+[class*="st-key-dl_csv"] button:hover, .st-key-dl_ua button:hover, .st-key-dl_upl button:hover{
+  background:#eff5ff;border-color:#2563eb;color:#1d4ed8;}
+[class*="st-key-dl_csv"] button *, .st-key-dl_ua button *, .st-key-dl_upl button *{color:#2563eb !important;}
+[class*="st-key-dl_xlsx"] button{background:linear-gradient(135deg,#12a58c,#0b7a6a);border:none;color:#fff;
+  border-radius:12px;font-weight:600;min-height:44px;box-shadow:0 4px 12px rgba(15,157,132,.28);}
+[class*="st-key-dl_xlsx"] button:hover{filter:brightness(1.08);color:#fff;}
+[class*="st-key-dl_xlsx"] button *{color:#fff !important;}
 
 /* ---------- cases by site ---------- */
 .sites-scroll{max-height:520px;overflow-y:auto;}
@@ -1159,14 +1171,16 @@ def case_dialog(case_id):
 
     doc_type, up = "", None
     if show_doc:
-        d1, d2 = st.columns([1, 2])
-        start = c.get("doc_type") or doc_default
-        doc_type = d1.selectbox("Document type", DOC_TYPES, key=f"dtype_{case_id}",
-                                index=DOC_TYPES.index(start) if start in DOC_TYPES else 0)
-        up = d2.file_uploader("Upload sick leave certificate (optional)" if optional_doc else "Supporting document",
-                              type=["pdf", "jpg", "jpeg", "png", "doc", "docx"], key=f"file_{case_id}")
-        if optional_doc:
+        file_types = ["pdf", "jpg", "jpeg", "png", "doc", "docx"]
+        if optional_doc:                                   # Sick Leave: optional upload only
+            up = st.file_uploader("Upload sick leave certificate (optional)", type=file_types, key=f"file_{case_id}")
             st.caption("Optional - you can submit the case with or without the sick leave document.")
+        else:                                              # Unauthorized L2+: warning letter (required)
+            d1, d2 = st.columns([1, 2])
+            start = c.get("doc_type") or doc_default
+            doc_type = d1.selectbox("Document type", DOC_TYPES, key=f"dtype_{case_id}",
+                                    index=DOC_TYPES.index(start) if start in DOC_TYPES else 0)
+            up = d2.file_uploader("Supporting document", type=file_types, key=f"file_{case_id}")
         show_existing_doc(c["id"], c.get("doc_file"), "form")
         if c.get("doc_file"):
             st.caption("Upload a new file only if you want to replace the current one.")
