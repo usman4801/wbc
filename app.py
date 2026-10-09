@@ -2,6 +2,7 @@ import streamlit as st
 import sqlite3
 import os
 import datetime
+import pandas as pd
 
 # ----------------------------------------------------------------
 # CONFIG & DATABASE SETUP
@@ -42,13 +43,37 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_cases_site ON cases(site)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status)")
     
-    # Seed users cleanly
+    # Seed default users
     c.execute("INSERT OR REPLACE INTO users (alias, role, sites, added, token) VALUES ('mnnafee', 'Admin', 'All', ?, 'mnnafee')", 
               (str(datetime.date.today()),))
     c.execute("INSERT OR REPLACE INTO users (alias, role, sites, added, token) VALUES ('javmuhak', 'VPOC', 'All', ?, 'javmuhak')", 
               (str(datetime.date.today()),))
               
     conn.commit()
+    
+    # AUTO-IMPORT EXCEL FILE IF CASES TABLE IS EMPTY
+    count = c.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+    if count == 0:
+        # Check for excel file in current directory
+        excel_files = [f for f in os.listdir('.') if f.endswith('.xlsx') or f.endswith('.xls')]
+        if excel_files:
+            try:
+                file_path = excel_files[0]
+                df = pd.read_excel(file_path)
+                # Clean columns or map if necessary, inserting records safely
+                for _, row in df.iterrows():
+                    case_id = str(row.get('id', row.get('ID', row.get('Login', ''))))
+                    login = str(row.get('login', row.get('Login', 'unknown')))
+                    if not case_id or case_id == 'nan':
+                        case_id = f"AUTO-{datetime.datetime.now().timestamp()}"
+                    
+                    c.execute('''INSERT OR IGNORE INTO cases (id, login, name, site, status, created) 
+                                 VALUES (?, ?, ?, ?, ?, ?)''', 
+                              (case_id, login, str(row.get('name', '')), str(row.get('site', '')), 'Open', str(datetime.date.today())))
+                conn.commit()
+            except Exception as e:
+                print("Error auto-importing excel:", e)
+                
     conn.close()
 
 init_db()
@@ -74,7 +99,7 @@ if "token" in query_params and not st.session_state.token:
 current_user = get_user_by_credential(st.session_state.token)
 
 # ----------------------------------------------------------------
-# LOGIN SCREEN (Agar login nahi hai)
+# LOGIN SCREEN
 # ----------------------------------------------------------------
 if not current_user:
     st.title("🔐 WBC Portal - Authentication")
@@ -93,7 +118,7 @@ if not current_user:
     st.stop()
 
 # ----------------------------------------------------------------
-# STREAMLIT DASHBOARD (DIRECT DATA VIEW AFTER LOGIN)
+# STREAMLIT DASHBOARD
 # ----------------------------------------------------------------
 st.sidebar.title(f"👤 Welcome, {current_user['alias'].upper()}")
 st.sidebar.markdown(f"**Role:** {current_user['role']} | **Sites:** {current_user['sites']}")
@@ -115,7 +140,7 @@ if menu == "Cases Dashboard":
     if cases_list:
         st.dataframe(cases_list, use_container_width=True)
     else:
-        st.info("No cases found in the database. Data will appear here automatically when available.")
+        st.info("No cases found in the database.")
 
 elif menu == "UA Offences":
     st.header("⚠️ UA Offences Tracker")
