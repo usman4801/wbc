@@ -51,45 +51,46 @@ def init_db():
               
     conn.commit()
     
-    # EXACT COLUMN MATCHING AUTO-IMPORT FROM EXCEL
-    count = c.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
-    if count == 0:
-        excel_files = [f for f in os.listdir('.') if f.endswith('.xlsx') or f.endswith('.xls')]
-        if excel_files:
-            try:
-                file_path = excel_files[0]
-                df = pd.read_excel(file_path)
+    # FORCE RELOAD EXCEL AND MAP COLUMNS PROPERLY
+    excel_files = [f for f in os.listdir('.') if f.endswith('.xlsx') or f.endswith('.xls')]
+    if excel_files:
+        try:
+            file_path = excel_files[0]
+            df = pd.read_excel(file_path)
+            
+            # Clear old cases table to prevent caching issues
+            c.execute("DELETE FROM cases")
+            
+            for _, row in df.iterrows():
+                row_dict = {str(k).strip().lower(): v for k, v in row.items() if pd.notna(v)}
+                vals = list(row_dict.values())
                 
-                for _, row in df.iterrows():
-                    # Clean column names mapping
-                    row_dict = {str(k).strip().lower(): v for k, v in row.items() if pd.notna(v)}
-                    
-                    def get_field(possible_keys):
-                        for k in possible_keys:
-                            if k in row_dict:
-                                return str(row_dict[k])
-                        return ""
+                def find_val(keywords):
+                    for k, v in row_dict.items():
+                        if any(kw in k for kw in keywords):
+                            return str(v)
+                    return ""
 
-                    case_id = get_field(['id', 'case id', 'case_id']) or f"AUTO-{datetime.datetime.now().timestamp()}"
-                    login = get_field(['login', 'username', 'user', 'alias']) or 'unknown'
-                    empid = get_field(['empid', 'emp id', 'employee id', 'emp_id'])
-                    name = get_field(['name', 'employee name', 'full name', 'worker'])
-                    site = get_field(['site', 'location', 'facility'])
-                    mgr = get_field(['mgr', 'manager', 'supervisor', 'reporting manager'])
-                    shift = get_field(['shift', 'timing'])
-                    agency = get_field(['agency', 'vendor'])
-                    absent = get_field(['absent', 'absence date', 'date of absence', 'absent_date'])
-                    created = get_field(['created', 'created date', 'date'], str(datetime.date.today()))
-                    status = get_field(['status'], 'Open')
-                    
-                    c.execute('''INSERT OR REPLACE INTO cases (
-                        id, login, empid, name, site, mgr, shift, agency, absent, created, status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
-                    (case_id, login, empid, name, site, mgr, shift, agency, absent, created, status))
+                case_id = find_val(['id', 'case id', 'case_id']) or (str(vals[0]) if len(vals) > 0 else f"AUTO-{datetime.datetime.now().timestamp()}")
+                login = find_val(['login', 'username', 'user', 'alias']) or (str(vals[1]) if len(vals) > 1 else 'unknown')
+                empid = find_val(['empid', 'emp id', 'employee id', 'emp_id'])
+                name = find_val(['name', 'employee name', 'full name', 'worker'])
+                site = find_val(['site', 'location', 'facility'])
+                mgr = find_val(['mgr', 'manager', 'supervisor', 'reporting manager'])
+                shift = find_val(['shift', 'timing'])
+                agency = find_val(['agency', 'vendor'])
+                absent = find_val(['absent', 'absence date', 'date of absence', 'absent_date'])
+                created = find_val(['created', 'created date', 'date'], str(datetime.date.today()))
+                status = find_val(['status'], 'Open')
                 
-                conn.commit()
-            except Exception as e:
-                print("Error during auto-import:", e)
+                c.execute('''INSERT OR REPLACE INTO cases (
+                    id, login, empid, name, site, mgr, shift, agency, absent, created, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
+                (str(case_id), str(login), str(empid), str(name), str(site), str(mgr), str(shift), str(agency), str(absent), str(created), str(status)))
+            
+            conn.commit()
+        except Exception as e:
+            print("Error parsing excel:", e)
                 
     conn.close()
 
@@ -116,7 +117,7 @@ if "token" in query_params and not st.session_state.token:
 current_user = get_user_by_credential(st.session_state.token)
 
 # ----------------------------------------------------------------
-# LOGIN SCREEN (ENGLISH ONLY)
+# LOGIN SCREEN
 # ----------------------------------------------------------------
 if not current_user:
     st.title("🔐 WBC Portal - Authentication")
@@ -135,7 +136,7 @@ if not current_user:
     st.stop()
 
 # ----------------------------------------------------------------
-# STREAMLIT DASHBOARD (ENGLISH ONLY)
+# STREAMLIT DASHBOARD
 # ----------------------------------------------------------------
 st.sidebar.title(f"👤 Welcome, {current_user['alias'].upper()}")
 st.sidebar.markdown(f"**Role:** {current_user['role']} | **Sites:** {current_user['sites']}")
