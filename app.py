@@ -51,25 +51,42 @@ def init_db():
               
     conn.commit()
     
-    # AUTO-IMPORT EXCEL FILE IF CASES TABLE IS EMPTY
+    # AUTO-IMPORT EXCEL FILE PROPERLY
     count = c.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
     if count == 0:
-        # Check for excel file in current directory
         excel_files = [f for f in os.listdir('.') if f.endswith('.xlsx') or f.endswith('.xls')]
         if excel_files:
             try:
                 file_path = excel_files[0]
                 df = pd.read_excel(file_path)
-                # Clean columns or map if necessary, inserting records safely
+                # Normalize column names to lowercase/stripped to avoid mismatch
+                df.columns = [str(col).strip().lower() for col in df.columns]
+                
                 for _, row in df.iterrows():
-                    case_id = str(row.get('id', row.get('ID', row.get('Login', ''))))
-                    login = str(row.get('login', row.get('Login', 'unknown')))
-                    if not case_id or case_id == 'nan':
-                        case_id = f"AUTO-{datetime.datetime.now().timestamp()}"
+                    # Helper to safely fetch values from various possible column header names
+                    def get_val(keys, default=""):
+                        for k in keys:
+                            if k in df.columns and pd.notna(row[k]):
+                                return str(row[k])
+                        return default
+
+                    case_id = get_val(['id', 'case_id', 'case id'], f"AUTO-{datetime.datetime.now().timestamp()}")
+                    login = get_val(['login', 'username', 'user'], 'unknown')
+                    empid = get_val(['empid', 'emp_id', 'employee id', 'id'])
+                    name = get_val(['name', 'employee name', 'full name'])
+                    site = get_val(['site', 'location', 'facility'])
+                    mgr = get_val(['mgr', 'manager', 'supervisor'])
+                    shift = get_val(['shift', 'timing'])
+                    agency = get_val(['agency', 'vendor'])
+                    absent = get_val(['absent', 'absence_date', 'date'])
+                    created = get_val(['created', 'date', 'created_at'], str(datetime.date.today()))
+                    status = get_val(['status'], 'Open')
                     
-                    c.execute('''INSERT OR IGNORE INTO cases (id, login, name, site, status, created) 
-                                 VALUES (?, ?, ?, ?, ?, ?)''', 
-                              (case_id, login, str(row.get('name', '')), str(row.get('site', '')), 'Open', str(datetime.date.today())))
+                    c.execute('''INSERT OR REPLACE INTO cases (
+                        id, login, empid, name, site, mgr, shift, agency, absent, created, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
+                    (case_id, login, empid, name, site, mgr, shift, agency, absent, created, status))
+                
                 conn.commit()
             except Exception as e:
                 print("Error auto-importing excel:", e)
@@ -122,6 +139,12 @@ if not current_user:
 # ----------------------------------------------------------------
 st.sidebar.title(f"👤 Welcome, {current_user['alias'].upper()}")
 st.sidebar.markdown(f"**Role:** {current_user['role']} | **Sites:** {current_user['sites']}")
+
+# Add a button to reset/re-import database if needed
+if st.sidebar.button("🔄 Refresh Data from Excel"):
+    if os.path.exists("wbc.db"):
+        os.remove("wbc.db")
+    st.rerun()
 
 menu = st.sidebar.selectbox("Navigation", ["Cases Dashboard", "UA Offences", "UPL Summary", "User Management", "Settings"])
 
