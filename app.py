@@ -42,7 +42,7 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_cases_site ON cases(site)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status)")
     
-    # Seed users cleanly so alias works directly
+    # Seed users cleanly
     c.execute("INSERT OR REPLACE INTO users (alias, role, sites, added, token) VALUES ('mnnafee', 'Admin', 'All', ?, 'mnnafee')", 
               (str(datetime.date.today()),))
     c.execute("INSERT OR REPLACE INTO users (alias, role, sites, added, token) VALUES ('javmuhak', 'VPOC', 'All', ?, 'javmuhak')", 
@@ -54,7 +54,7 @@ def init_db():
 init_db()
 
 # ----------------------------------------------------------------
-# AUTHENTICATION (Direct Alias Login)
+# AUTHENTICATION
 # ----------------------------------------------------------------
 if "token" not in st.session_state:
     st.session_state.token = ""
@@ -63,7 +63,6 @@ def get_user_by_credential(val):
     if not val:
         return None
     db = get_db()
-    # Matches either token or exact alias name
     row = db.execute('SELECT * FROM users WHERE token=? OR alias=?', (val.strip().lower(), val.strip().lower())).fetchone()
     db.close()
     return dict(row) if row else None
@@ -75,7 +74,7 @@ if "token" in query_params and not st.session_state.token:
 current_user = get_user_by_credential(st.session_state.token)
 
 # ----------------------------------------------------------------
-# LOGIN / ACCESS GATE UI
+# LOGIN SCREEN (Agar login nahi hai)
 # ----------------------------------------------------------------
 if not current_user:
     st.title("🔐 WBC Portal - Authentication")
@@ -94,7 +93,7 @@ if not current_user:
     st.stop()
 
 # ----------------------------------------------------------------
-# STREAMLIT DASHBOARD (UI & LOGIC)
+# STREAMLIT DASHBOARD (DIRECT DATA VIEW AFTER LOGIN)
 # ----------------------------------------------------------------
 st.sidebar.title(f"👤 Welcome, {current_user['alias'].upper()}")
 st.sidebar.markdown(f"**Role:** {current_user['role']} | **Sites:** {current_user['sites']}")
@@ -116,7 +115,7 @@ if menu == "Cases Dashboard":
     if cases_list:
         st.dataframe(cases_list, use_container_width=True)
     else:
-        st.info("No cases found matching your access permissions.")
+        st.info("No cases found in the database. Data will appear here automatically when available.")
 
 elif menu == "UA Offences":
     st.header("⚠️ UA Offences Tracker")
