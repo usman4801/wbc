@@ -59,43 +59,43 @@ def init_db():
               
     conn.commit()
     
-    # IMPORT DATA FROM 'Roster' SHEET OF EXCEL AUTOMATICALLY
-    excel_files = [f for f in os.listdir('.') if f.endswith('.xlsx') or f.endswith('.xls')]
-    if excel_files:
-        try:
-            file_path = excel_files[0]
-            xls = pd.ExcelFile(file_path)
-            sheet_name = 'Roster' if 'Roster' in xls.sheet_names else xls.sheet_names[0]
-            
-            df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=5)
-            df.columns = [str(c).strip() for c in df.columns]
-            
-            c.execute("DELETE FROM cases")
-            
-            for idx, row in df.iterrows():
-                psoft_no = str(row.get('Psoft No', ''))
-                amz_id = str(row.get('AMZ ID', f'AUTO-{idx}'))
-                if amz_id == 'nan' or not amz_id:
-                    amz_id = f'AUTO-{idx}'
+    # AUTO-IMPORT DATA FROM 'Roster' SHEET OF EXCEL
+    count = c.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+    if count == 0:
+        excel_files = [f for f in os.listdir('.') if f.endswith('.xlsx') or f.endswith('.xls')]
+        if excel_files:
+            try:
+                file_path = excel_files[0]
+                xls = pd.ExcelFile(file_path)
+                sheet_name = 'Roster' if 'Roster' in xls.sheet_names else xls.sheet_names[0]
                 
-                name = str(row.get('EMP Name', ''))
-                site = str(row.get('Building', 'AUH1'))
-                mgr = str(row.get('Line Manager', ''))
-                shift = str(row.get('Shift', ''))
-                agency = str(row.get('3P', ''))
-                attendance = str(row.get('Attendance ', row.get('Attendance', 'Open')))
-                doj = str(row.get('DOJ', str(datetime.date.today())))
+                df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=5)
+                df.columns = [str(c).strip() for c in df.columns]
                 
-                case_id = f"CASE-{psoft_no if psoft_no and psoft_no != 'nan' else idx}"
+                for idx, row in df.iterrows():
+                    psoft_no = str(row.get('Psoft No', ''))
+                    amz_id = str(row.get('AMZ ID', f'AUTO-{idx}'))
+                    if amz_id == 'nan' or not amz_id:
+                        amz_id = f'AUTO-{idx}'
+                    
+                    name = str(row.get('EMP Name', ''))
+                    site = str(row.get('Building', 'AUH1'))
+                    mgr = str(row.get('Line Manager', ''))
+                    shift = str(row.get('Shift', ''))
+                    agency = str(row.get('3P', ''))
+                    attendance = str(row.get('Attendance ', row.get('Attendance', 'Open')))
+                    doj = str(row.get('DOJ', str(datetime.date.today())))
+                    
+                    case_id = f"CASE-{psoft_no if psoft_no and psoft_no != 'nan' else idx}"
+                    
+                    c.execute('''INSERT OR IGNORE INTO cases (
+                        id, login, empid, name, site, mgr, shift, agency, absent, created, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
+                    (str(case_id), str(amz_id), str(psoft_no), str(name), str(site), str(mgr), str(shift), str(agency), str(attendance), str(doj)[:10], "Open"))
                 
-                c.execute('''INSERT OR REPLACE INTO cases (
-                    id, login, empid, name, site, mgr, shift, agency, absent, created, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
-                (str(case_id), str(amz_id), str(psoft_no), str(name), str(site), str(mgr), str(shift), str(agency), str(attendance), str(doj)[:10], "Open"))
-            
-            conn.commit()
-        except Exception as e:
-            print("Error loading excel sheet:", e)
+                conn.commit()
+            except Exception as e:
+                print("Error loading excel sheet:", e)
                 
     conn.close()
 
@@ -164,8 +164,8 @@ if menu == "Cases Dashboard":
     
     query = 'SELECT * FROM cases'
     params = []
-    
     conditions = []
+    
     if selected_site != 'All Sites':
         conditions.append('site = ?')
         params.append(selected_site)
@@ -218,7 +218,6 @@ elif menu == "User Management":
 
 elif menu == "Settings":
     st.header("⚙️ Application Settings")
-    settings_rows = db.execute('SELECT *').fetchall() if False else []
     st.info("System configuration settings are up to date.")
 
 db.close()
