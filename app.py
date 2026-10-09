@@ -7,6 +7,7 @@ import copy
 import math
 import shutil
 import hashlib
+import re
 import tempfile
 import datetime
 import html as _html
@@ -213,6 +214,8 @@ LOGIN_CSS = """
 .st-key-card_login .brand{justify-content:center;padding-bottom:4px;}
 .login-t{text-align:center;font-size:1.25rem;font-weight:800;color:#0f1f4b;margin:8px 0 2px;}
 .login-s{text-align:center;font-size:.8rem;color:#64748b;margin-bottom:8px;}
+.login-help{text-align:center;font-size:.72rem;color:#94a3b8;margin-top:10px;}
+.login-help b{color:#64748b;}
 .st-key-card_login button[data-testid="stBaseButton-secondary"]{background:#7b6be8;color:#fff;border:none;
   border-radius:10px;font-weight:600;min-height:40px;}
 </style>
@@ -319,11 +322,13 @@ def allowed_sites(user):
 
 
 def is_admin(user):
-    return str(user.get("role", "")).lower() == "admin"
+    """Admin role, or an alias in USER_MGMT_BYPASS (e.g. javmuhak: shown as VPOC but has every admin power)."""
+    return (str(user.get("role", "")).lower() == "admin"
+            or str(user.get("alias", "")).lower() in USER_MGMT_BYPASS)
 
 
 def is_admin_role(user):
-    return str(user.get("role", "")).lower() in ADMIN_ROLES
+    return str(user.get("role", "")).lower() in ADMIN_ROLES or is_admin(user)
 
 
 def to_excel_bytes(df, sheet="Cases"):
@@ -360,6 +365,8 @@ def prepare(df):
     end = pd.to_datetime(df["closed"], errors="coerce").where(df["_g"] == "closed").fillna(today)
     df["_days"] = (end - df["_created"]).dt.days
     df["_type"] = df["outcome"].replace("", pd.NA).fillna("Attendance")
+    # an "open" case that is only a planned leave (PL) is not an absence - it is never counted as open
+    df["_open"] = (df["_g"] == "open") & (df["absent"].astype(str).str.strip().str.upper() != "PL")
     return df
 
 
@@ -618,7 +625,7 @@ def top_open_sites(df, n=TOP_N_SITES):
     """Returns (open cases with a site, [(site, open_count), ...] for the top n sites)."""
     if df.empty:
         return df, []
-    op = df[(df["_g"] == "open") & (df["site"].astype(str).str.strip() != "")]
+    op = df[df["_open"] & (df["site"].astype(str).str.strip() != "")]
     counts = op["site"].value_counts().to_dict()
     top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
     return op, top
@@ -665,7 +672,7 @@ def mountain_html(df):
     lead, lead_n = top[0]
 
     banner = (f'<div class="mtn-top"><div><div class="mtn-k">Highest open cases</div>'
-              f'<div class="mtn-v">🏆 {esc(lead)}</div></div>'
+              f'<div class="mtn-v">{esc(lead)}</div></div>'
               f'<div class="mtn-badge">{lead_n} open · {lead_n / total_open * 100:.1f}%</div></div>')
 
     d = op[op["site"].isin(names) & op["_created"].notna()].copy()
@@ -730,7 +737,7 @@ def mountain_html(df):
 
     tiles = []
     for i, (s, c) in enumerate(top):
-        tiles.append(f'<div class="mtn-tile" style="border-top-color:{colors[s]}"><em>{"🏆 " if i == 0 else ""}{esc(s)}</em>'
+        tiles.append(f'<div class="mtn-tile" style="border-top-color:{colors[s]}"><em>{esc(s)}</em>'
                      f'<b>{int(c)}</b><small>{c / total_open * 100:.1f}% of open</small></div>')
     return banner + caption + chart + '<div class="mtn-legend">' + "".join(tiles) + '</div>'
 
@@ -742,9 +749,7 @@ def mountain_html(df):
 IMPORT_TABLES = {
     "cases": ("id", None),
     "upl_summary": ("login", None),
-    "users": ("alias", None),
     "ua_offences": (None, "m.login=o.login AND m.date=o.date AND IFNULL(m.offence_type,'')=IFNULL(o.offence_type,'')"),
-    "access_requests": (None, "IFNULL(m.alias,'')=IFNULL(o.alias,'') AND IFNULL(m.requested_at,'')=IFNULL(o.requested_at,'')"),
     "custom_sites": (None, "m.country=o.country AND m.bu=o.bu AND m.site=o.site"),
 }
 
@@ -1243,7 +1248,7 @@ def page_dashboard():
     g = df["_g"]
     pending = ~g.isin(["open", "closed"])
     st.markdown(chips_html([
-        ("Total Cases", len(df)), ("Open Cases", int((g == "open").sum())),
+        ("Total Cases", len(df)), ("Open Cases", int(df["_open"].sum())),
         ("Closed Cases", int((g == "closed").sum())), ("Pending Cases", int(pending.sum())),
         ("Pending > 5 Days", int((pending & (df["_days"] > 5)).sum()))]), unsafe_allow_html=True)
 
@@ -1310,7 +1315,7 @@ def page_cases():
         status = e.selectbox("Status", ["All Status", "Open", "In Review / Pending", "Closed"],
                              label_visibility="collapsed", key="cd_status")
         if status == "Open":
-            view = view[view["_g"] == "open"]
+            view = view[view["_open"]]
         elif status == "Closed":
             view = view[view["_g"] == "closed"]
         elif status != "All Status":
@@ -1441,16 +1446,64 @@ def page_sync():
             (st.success if ok else st.error)(msg)
 
 
+ACCESS_ROLES = ["VPOC", "HRBP"]               # the only two roles that can be given
+
+
+def can_manage_access(user):
+    return is_admin(user) or str(user.get("alias", "")).lower() in USER_MGMT_BYPASS
+
+
+def _add_access():
+    alias = str(st.session_state.get("acc_alias", "")).strip().lower()
+    role = st.session_state.get("acc_role", ACCESS_ROLES[0])
+    sites = st.session_state.get("acc_sites", []) or []
+    if not re.fullmatch(r"[a-z0-9._-]+", alias):
+        st.session_state["_acc_msg"] = (False, "Enter a valid alias (letters, numbers, dot, dash or underscore - no spaces).")
+    elif role not in ACCESS_ROLES:
+        st.session_state["_acc_msg"] = (False, "Role must be VPOC or HRBP.")
+    elif query("SELECT 1 FROM users WHERE alias=?", (alias,)):
+        st.session_state["_acc_msg"] = (False, f"{alias} already has access.")
+    else:
+        execute("INSERT INTO users (alias, role, sites, added, token) VALUES (?,?,?,?,?)",
+                (alias, role, ",".join(sites) if (sites and role == "HRBP") else "All", str(datetime.date.today()), alias))
+        st.session_state["_acc_msg"] = (True, f"{alias} can now open the portal as {role}.")
+        st.session_state["acc_alias"] = ""
+        st.session_state["acc_sites"] = []
+
+
 def page_users():
     user = current()
-    page_shell("User Management", "Manage administrative users, roles, and facility permissions.")
-    if not (is_admin(user) or str(user.get("alias", "")).lower() in USER_MGMT_BYPASS):
-        st.error("Access Denied: Admin privileges required to view users.")
+    page_shell("Admin Access", "Give people access to the portal. Anyone added here can sign in with their alias.")
+    if not can_manage_access(user):
+        st.error("Access Denied: only an admin can give portal access.")
         return
-    data = read_table("SELECT alias, role, sites, added, token FROM users")
+
+    with st.container(border=True, key="card_access_add"):
+        st.markdown(card_header_html("user", "Give Access", "Add a login - they can open the tool straight away"),
+                    unsafe_allow_html=True)
+        a, b, c, d = st.columns([1.2, 0.8, 1.6, 0.8], vertical_alignment="bottom")
+        a.text_input("User alias", placeholder="e.g. javmuhak", key="acc_alias")
+        b.selectbox("Role", ACCESS_ROLES, key="acc_role")
+        c.multiselect("Sites - HRBP only (empty = all sites; VPOC always sees all)", sorted(site_meta(get_site_map())), key="acc_sites")
+        d.button("Add access", type="primary", key="acc_add", on_click=_add_access, use_container_width=True)
+        msg = st.session_state.pop("_acc_msg", None)
+        if msg:
+            (st.success if msg[0] else st.error)(msg[1])
+
+    people = query("SELECT alias, role, sites, added FROM users ORDER BY added DESC, alias")
     with st.container(border=True, key="card_users"):
-        st.markdown(card_header_html("user", "Portal Users", "Roles and facility permissions"), unsafe_allow_html=True)
-        st.dataframe(data, use_container_width=True, height=380, hide_index=True)
+        st.markdown(card_header_html("list", "People with access", f"{len(people)} logins can open the portal"),
+                    unsafe_allow_html=True)
+        for p in people:
+            x, y = st.columns([5, 1], vertical_alignment="center")
+            x.markdown(f'<div class="td"><b>{esc(p["alias"])}</b> · {esc(p["role"])} · '
+                       f'{esc(p["sites"] or "All")} · added {esc(p["added"])}</div>', unsafe_allow_html=True)
+            locked = (p["alias"] == user["alias"] or str(p["role"]).lower() == "admin"
+                      or p["alias"] in USER_MGMT_BYPASS)
+            if not locked and y.button("Remove", key=f"rm_user_{p['alias']}"):
+                execute("DELETE FROM users WHERE alias=?", (p["alias"],))
+                st.session_state["_flash"] = f"{p['alias']} no longer has access."
+                st.rerun()
 
     with st.container(border=True, key="card_sitesadmin"):
         st.markdown(card_header_html("pin", "Manage Sites", "Add a site to the Country / BU / Site selector"),
@@ -1530,7 +1583,7 @@ def page_settings():
 
         with st.container(border=True, key="card_import"):
             st.markdown(card_header_html("list", "Import old database",
-                                         "Bring cases, UA offences, UPL, users and sites over from the old portal's wbc.db"),
+                                         "Bring cases, UA offences, UPL and sites over from the old portal's wbc.db (users are not imported - give access on the Admin Access page)"),
                         unsafe_allow_html=True)
             up = st.file_uploader("Old wbc.db", type=["db", "sqlite", "sqlite3"], key="imp_file")
             mode = st.radio("Mode", ["Merge into current data (old rows win on the same ID)",
@@ -1576,6 +1629,7 @@ def main():
                         st.rerun()
                     else:
                         st.error("Invalid alias. Please verify and try again.")
+                st.markdown('<div class="login-help">Access issue? Contact <b>mnnafee</b></div>', unsafe_allow_html=True)
         st.stop()
 
     st.session_state["_user"] = user
@@ -1588,9 +1642,11 @@ def main():
         st.Page(page_upl, title="UPL Summary Analytics", icon=":material/bar_chart:", url_path="upl-summary"),
         st.Page(page_disciplinary, title="Disciplinary Actions", icon=":material/gavel:", url_path="disciplinary"),
         st.Page(page_sync, title="DWD Sync", icon=":material/sync:", url_path="dwd-sync"),
-        st.Page(page_users, title="User Management", icon=":material/person:", url_path="users"),
         st.Page(page_settings, title="Settings", icon=":material/settings:", url_path="settings"),
     ]
+    if can_manage_access(user):          # only people who can give access see this page
+        pages.insert(6, st.Page(page_users, title="Admin Access", icon=":material/admin_panel_settings:",
+                                url_path="admin-access"))
     try:
         nav = st.navigation(pages, position="hidden")
     except TypeError:           # older Streamlit: default nav is hidden by CSS instead
