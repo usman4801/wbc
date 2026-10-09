@@ -1212,6 +1212,54 @@ def page_upl():
                upl_chips, "No UPL summary data available.", "upl")
 
 
+DISC_COLS = ["closed", "id", "login", "name", "empid", "site", "mgr", "agency", "absent", "outcome",
+             "escalation_level", "escalation_action", "escalation_valid_until", "doc_type", "doc_file",
+             "reason", "closed_by"]
+DISC_LABELS = {"closed": "Closed Date", "id": "Case ID", "login": "Login", "name": "Name", "empid": "Employee ID",
+               "site": "Site", "mgr": "Manager", "agency": "Agency", "absent": "Absent Date", "outcome": "Decision",
+               "escalation_level": "Escalation Level", "escalation_action": "Disciplinary Action",
+               "escalation_valid_until": "Valid Until", "doc_type": "Document Type", "doc_file": "Document File",
+               "reason": "Remarks", "closed_by": "Closed By"}
+
+
+def page_disciplinary():
+    user = current()
+    df = load_cases(user)
+    page_shell("Disciplinary Actions", "Every closed case: Authorized / Unauthorized decision, escalation and warning letter.")
+    closed = df[df["_g"] == "closed"].copy()
+    closed["closed_by"] = closed["closed_by"].where(closed["closed_by"] != "", closed["closedby"])
+    st.markdown(chips_html([
+        ("Closed Cases", len(closed)),
+        ("Unauthorized", int((closed["outcome"] == "Unauthorized").sum())),
+        ("Authorized", int((closed["outcome"] == "Authorized").sum())),
+        ("Other", int((~closed["outcome"].isin(["Unauthorized", "Authorized"])).sum()))]), unsafe_allow_html=True)
+    with st.container(border=True, key="card_disc"):
+        st.markdown(card_header_html("check", "Disciplinary Action Register",
+                                     "Saved automatically when a case is closed from the Dashboard"),
+                    unsafe_allow_html=True)
+        a, b, c, d = st.columns([1, 0.8, 1.3, 1.2])
+        view = site_filters(closed, "da", [a, b, c])
+        decisions = ["All Decisions"] + sorted(o for o in closed["outcome"].unique() if o)
+        _valid_or_reset("da_outcome", decisions)
+        pick = d.selectbox("Decision", decisions, key="da_outcome", label_visibility="collapsed")
+        if pick != "All Decisions":
+            view = view[view["outcome"] == pick]
+        out = view[DISC_COLS].sort_values("closed", ascending=False).rename(columns=DISC_LABELS)
+        if out.empty:
+            st.info("No closed cases yet. When a case is closed as Authorized or Unauthorized it appears here "
+                    "(for old cases, import the old wbc.db in Settings).")
+        else:
+            st.dataframe(out, use_container_width=True, height=440, hide_index=True)
+            d1, d2, _ = st.columns([1, 1, 4])
+            d1.download_button("⬇ Export CSV", out.to_csv(index=False).encode(), "disciplinary_actions.csv",
+                               "text/csv", key="dl_csv_disc", use_container_width=True)
+            xl = to_excel_bytes(out, "Disciplinary Actions")
+            if xl:
+                d2.download_button("⬇ Export Excel", xl, "disciplinary_actions.xlsx",
+                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   key="dl_xlsx_disc", use_container_width=True)
+
+
 def page_sync():
     user = current()
     page_shell("DWD Sync", "Create absence cases from the daily DWD CSV (same logic as the old portal).")
@@ -1356,6 +1404,7 @@ def main():
         st.Page(page_cases, title="Cases Dashboard", icon=":material/table_chart:", url_path="cases"),
         st.Page(page_ua, title="UA Offences Tracker", icon=":material/shield:", url_path="ua-offences"),
         st.Page(page_upl, title="UPL Summary Analytics", icon=":material/bar_chart:", url_path="upl-summary"),
+        st.Page(page_disciplinary, title="Disciplinary Actions", icon=":material/gavel:", url_path="disciplinary"),
         st.Page(page_sync, title="DWD Sync", icon=":material/sync:", url_path="dwd-sync"),
         st.Page(page_users, title="User Management", icon=":material/person:", url_path="users"),
         st.Page(page_settings, title="Settings", icon=":material/settings:", url_path="settings"),
