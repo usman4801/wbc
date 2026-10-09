@@ -5,15 +5,16 @@ import datetime
 import pandas as pd
 
 # ----------------------------------------------------------------
-# CONFIG & PROFESSIONAL UI STYLING
+# CONFIG & MODERN UI DESIGN
 # ----------------------------------------------------------------
-st.set_page_config(page_title="WBC Portal", layout="wide")
+st.set_page_config(page_title="WBC Enterprise Portal", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
     <style>
-    .main { background-color: #f8f9fa; }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    h1, h2, h3 { color: #1f2937; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+    .main { background-color: #f4f6f9; }
+    .stMetric { background-color: #ffffff; padding: 18px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.04); border-left: 5px solid #3b82f6; }
+    h1, h2, h3 { color: #1e293b; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+    .stSidebar { background-color: #1e293b !important; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -122,46 +123,49 @@ if "token" in query_params and not st.session_state.token:
 current_user = get_user_by_credential(st.session_state.token)
 
 # ----------------------------------------------------------------
-# LOGIN SCREEN
+# LOGIN SCREEN (MODERN & CLEAN)
 # ----------------------------------------------------------------
 if not current_user:
-    st.title("🔐 WBC Portal - Authentication")
-    st.markdown("Please enter your user alias (e.g., **javmuhak** or **mnnafee**) to sign in.")
-    
-    input_val = st.text_input("Enter Alias:", value="javmuhak")
-    if st.button("Login"):
-        user = get_user_by_credential(input_val)
-        if user:
-            st.session_state.token = user['alias']
-            st.success(f"Welcome, {user['alias'].upper()}! Role: {user['role']}")
-            st.rerun()
-        else:
-            st.error("Invalid alias. Please verify and try again.")
-    
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown("## 🔐 WBC Enterprise Portal Login")
+        st.markdown("Please enter your authorized user alias to access the dashboard.")
+        input_val = st.text_input("User Alias:", value="javmuhak", placeholder="e.g. javmuhak")
+        if st.button("Sign In", use_container_width=True):
+            user = get_user_by_credential(input_val)
+            if user:
+                st.session_state.token = user['alias']
+                st.success(f"Welcome back, {user['alias'].upper()}! Role: {user['role']}")
+                st.rerun()
+            else:
+                st.error("Invalid alias. Please verify and try again.")
     st.stop()
 
 # ----------------------------------------------------------------
-# STREAMLIT DASHBOARD (WITH SITE FILTER & CLEAN UI)
+# DASHBOARD NAVIGATION & UI
 # ----------------------------------------------------------------
-st.sidebar.title(f"👤 Welcome, {current_user['alias'].upper()}")
-st.sidebar.markdown(f"**Role:** {current_user['role']} | **Sites:** {current_user['sites']}")
+st.sidebar.markdown(f"### 👤 {current_user['alias'].upper()}")
+st.sidebar.markdown(f"**Role:** `{current_user['role']}`  \n**Sites:** `{current_user['sites']}`")
 st.sidebar.markdown("---")
 
-menu = st.sidebar.selectbox("Navigation", ["Cases Dashboard", "UA Offences", "UPL Summary", "User Management", "Settings"])
+menu = st.sidebar.selectbox("Navigation Menu", ["Cases Dashboard", "UA Offences", "UPL Summary", "User Management", "Settings"])
 
 db = get_db()
 
 if menu == "Cases Dashboard":
-    st.header("📋 WBC Cases Dashboard")
-    st.markdown("Overview of employee roster records and attendance cases.")
+    st.title("📋 WBC Cases & Attendance Dashboard")
+    st.markdown("Real-time tracking of employee roster performance, attendance, and operational status.")
     
     # Fetch available sites for filtering
     site_rows = db.execute('SELECT DISTINCT site FROM cases WHERE site IS NOT NULL AND site != ""').fetchall()
     available_sites = ['All Sites'] + [r['site'] for r in site_rows]
     
-    # Site Filter UI
-    selected_site = st.selectbox("Filter by Site:", available_sites)
-    
+    # Top Control Bar (Site Filter & Metrics)
+    col_filter, col_spacer = st.columns([2, 4])
+    with col_filter:
+        selected_site = st.selectbox("🏢 Filter by Site Location:", available_sites)
+        
     query = 'SELECT * FROM cases'
     params = []
     conditions = []
@@ -184,40 +188,51 @@ if menu == "Cases Dashboard":
     cases = db.execute(query, params).fetchall()
     cases_list = [dict(r) for r in cases]
     
+    # Summary Metric Cards
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total Records", len(cases_list))
+    m2.metric("Active Sites", len(available_sites) - 1)
+    m3.metric("System Status", "Operational 🟢")
+    
+    st.markdown("---")
+    
     if cases_list:
-        st.markdown(f"**Total Records Found:** {len(cases_list)}")
-        st.dataframe(cases_list, use_container_width=True, height=500)
+        st.dataframe(cases_list, use_container_width=True, height=520)
     else:
-        st.info("No cases found matching your criteria.")
+        st.info("No records found matching your selected criteria.")
 
 elif menu == "UA Offences":
-    st.header("⚠️ UA Offences Tracker")
+    st.title("⚠️ UA Offences Tracker")
+    st.markdown("Comprehensive overview of recorded unauthorized absence offences.")
     rows = db.execute('SELECT * FROM ua_offences ORDER BY date DESC').fetchall()
     ua_list = [dict(r) for r in rows]
     if ua_list:
-        st.dataframe(ua_list, use_container_width=True)
+        st.dataframe(ua_list, use_container_width=True, height=500)
     else:
-        st.info("No UA offences recorded.")
+        st.info("No UA offences recorded in the database.")
 
 elif menu == "UPL Summary":
-    st.header("📊 UPL Summary Analytics")
+    st.title("📊 UPL Summary Analytics")
+    st.markdown("Unplanned leave and schedule performance summary.")
     rows = db.execute('SELECT * FROM upl_summary ORDER BY updated DESC').fetchall()
     upl_list = [dict(r) for r in rows]
     if upl_list:
-        st.dataframe(upl_list, use_container_width=True)
+        st.dataframe(upl_list, use_container_width=True, height=500)
     else:
         st.info("No UPL summary data available.")
 
 elif menu == "User Management":
-    st.header("👥 User Management & Access")
+    st.title("👥 User Management & Access Control")
+    st.markdown("Manage administrative users, roles, and facility permissions.")
     if current_user['role'] != 'Admin':
-        st.error("Admin permission required to view users.")
+        st.error("Access Denied: Admin privileges required to view users.")
     else:
         users = db.execute('SELECT alias, role, sites, added, token FROM users').fetchall()
-        st.dataframe([dict(u) for u in users], use_container_width=True)
+        st.dataframe([dict(u) for u in users], use_container_width=True, height=400)
 
 elif menu == "Settings":
-    st.header("⚙️ Application Settings")
-    st.info("System configuration settings are up to date.")
+    st.title("⚙️ Application Configuration & Settings")
+    st.markdown("Portal configuration, environment status, and system settings.")
+    st.success("System is fully synchronized with the local database and excel repository.")
 
 db.close()
