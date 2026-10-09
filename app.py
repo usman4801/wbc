@@ -1,6 +1,7 @@
 import streamlit as st
 import sqlite3
 import os
+import io
 import math
 import datetime
 import html as _html
@@ -15,10 +16,23 @@ st.set_page_config(page_title="WBC Portal", page_icon="🛡️", layout="wide",
 DB_PATH = os.environ.get("WBC_DB_PATH", "wbc.db")
 PAGE_SIZE = 8
 
+UAL = ["", "Verbal Coaching", "Documented Coaching", "First Warning",
+       "Second Warning", "Final Warning", "Termination"]
+REASONS = {"Sick Leave": "Sick Leave", "Authorized": "Authorized", "Unauthorized": "Unauthorized",
+           "Incorrect Entry on DWD": "Incorrect Entry on DWD", "Converted to PL": "Converted to PL"}
+NO_DOC = {"Incorrect Entry on DWD", "Converted to PL"}            # no document needed
+UPL_REVERSING = {"Incorrect", "Incorrect Entry on DWD", "Converted to PL"}   # take a day off UPL
+DOC_TYPES = ["", "Medical Certificate", "HRBP Approval", "Warning Letter", "Email Approval", "Other"]
+ADMIN_ROLES = ("Admin", "HRBP")                                   # can override escalation level
+UPLOAD_DIR = os.environ.get("WBC_UPLOAD_DIR", "wbc_uploads")
+S3_BUCKET = os.environ.get("WBC_S3_BUCKET", "")                   # optional: upload to S3 instead
+S3_PREFIX = os.environ.get("WBC_S3_PREFIX", "wbc-uploads")
+
 CASE_COLS = ["id", "login", "empid", "name", "site", "mgr", "shift", "agency", "absent",
              "created", "status", "outcome", "reason", "doc_type", "doc_file", "notes",
              "closed", "source", "sick_hint", "ua_escalation_level",
-             "escalation_valid_until", "closedby", "on_site"]
+             "escalation_valid_until", "closedby", "on_site", "closed_by",
+             "escalation_level", "escalation_action"]
 
 
 # ----------------------------------------------------------------
@@ -133,6 +147,10 @@ h1,h2,h3{color:var(--navy);}
 /* ---------- dialog ---------- */
 .kv{display:grid;grid-template-columns:130px 1fr;gap:7px 12px;font-size:.84rem;}
 .kv b{color:#475569;font-weight:600;}
+.esc-box{background:linear-gradient(135deg,#fff1f2,#fef3c7);border:1.5px solid #f97316;border-radius:10px;
+  padding:10px 14px;margin:4px 0 10px;font-size:.8rem;color:#78350f;line-height:1.6;}
+.esc-t{font-size:.68rem;font-weight:700;color:#9a3412;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px;}
+.esc-lvl{font-size:1rem;font-weight:800;color:#c2410c;}
 </style>
 """
 
@@ -304,6 +322,13 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS upl_summary (login TEXT PRIMARY KEY, site TEXT DEFAULT '', scheduled_days INTEGER DEFAULT 0, upl_days INTEGER DEFAULT 0, updated TEXT DEFAULT '')''')
 
+    # columns used by the case-close flow (same names as the old Flask schema)
+    have = {r[1] for r in c.execute("PRAGMA table_info(cases)").fetchall()}
+    for col, ddl in (("closed_by", "TEXT DEFAULT ''"), ("escalation_level", "TEXT DEFAULT ''"),
+                     ("escalation_action", "TEXT DEFAULT ''")):
+        if col not in have:
+            c.execute(f"ALTER TABLE cases ADD COLUMN {col} {ddl}")
+
     # Indexes
     c.execute("CREATE INDEX IF NOT EXISTS idx_cases_login ON cases(login)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_cases_site ON cases(site)")
@@ -386,6 +411,20 @@ def load_cases(user):
     return prepare(df.fillna(""))
 
 
+def query(sql, params=()):
+    db = get_db()
+    rows = [dict(r) for r in db.execute(sql, params).fetchall()]
+    db.close()
+    return rows
+
+
+def execute(sql, params=()):
+    db = get_db()
+    db.execute(sql, params)
+    db.commit()
+    db.close()
+
+
 def read_table(sql):
     db = get_db()
     rows = [dict(r) for r in db.execute(sql).fetchall()]
@@ -401,6 +440,9 @@ def current():
 
 
 def page_shell(title, sub, wave=False):
+    flash = st.session_state.pop("_flash", None)
+    if flash:
+        st.toast(flash, icon="✅")
     st.markdown(topbar_html(current(), title, sub, wave), unsafe_allow_html=True)
 
 
@@ -408,15 +450,288 @@ def set_page(p):
     st.session_state.cases_page = p
 
 
-@st.dialog("Case details")
-def show_case(r):
-    rows = [("Case ID", clean_id(r["id"])), ("Employee", r["name"]), ("Login", r["login"]),
-            ("Employee ID", clean_id(r["empid"])), ("Site", r["site"]), ("Manager", r["mgr"]),
-            ("Shift", r["shift"]), ("Agency", r["agency"]), ("Attendance / absent", r["absent"]),
-            ("Opened", r["created"]), ("Status", r["status"]), ("Outcome", r["outcome"]),
-            ("Reason", r["reason"]), ("Notes", r["notes"])]
-    body = "".join(f"<b>{esc(k)}</b><span>{esc(v) or '–'}</span>" for k, v in rows)
-    st.markdown(f'<div class="kv">{body}</div>', unsafe_allow_html=True)
+# ----------------------------------------------------------------
+# CASE WORKFLOW  (ported from the old portal: remarks, authorized / unauthorized,
+# escalation, warning letter, verbatim)
+# ----------------------------------------------------------------
+def ua_status(dates, today=None):
+    """Offence chain: an offence counts only if the previous one is within 90 days."""
+    today = today or datetime.date.today()
+    ds = sorted({datetime.date.fromisoformat(str(d)[:10]) for d in dates if d})
+    chain = []
+    for i, d in enumerate(ds):
+        if i == 0 or (d - ds[i - 1]).days <= 90:
+            chain.append(d)
+        else:
+            chain = [d]
+    recent = [d for d in chain if (today - d).days <= 90]
+    level = min(len(recent), 6)
+    valid = (recent[-1] + datetime.timedelta(days=90)).isoformat() if recent else ""
+    return {"count": len(recent), "level": level, "valid_until": valid}
+
+
+def ua_for(login):
+    rows = query("SELECT date FROM ua_offences WHERE login=? ORDER BY date", (login,))
+    return ua_status([r["date"] for r in rows])
+
+
+def next_escalation(login):
+    lvl = min(ua_for(login)["level"] + 1, 6)
+    valid = (datetime.date.today() + datetime.timedelta(days=90)).isoformat()
+    return lvl, UAL[lvl], valid
+
+
+def save_upload(case_id, up):
+    safe = up.name.replace("/", "_").replace("\\", "_")
+    if S3_BUCKET:
+        import boto3
+        boto3.client("s3").upload_fileobj(io.BytesIO(up.getvalue()), S3_BUCKET, f"{S3_PREFIX}/{case_id}/{safe}",
+                                          ExtraArgs={"ContentType": up.type or "application/octet-stream"})
+    else:
+        folder = os.path.join(UPLOAD_DIR, case_id)
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, safe), "wb") as fh:
+            fh.write(up.getvalue())
+    return safe
+
+
+def show_existing_doc(case_id, filename, tag="a"):
+    if not filename:
+        return
+    if S3_BUCKET:
+        try:
+            import boto3
+            url = boto3.client("s3").generate_presigned_url(
+                "get_object", Params={"Bucket": S3_BUCKET, "Key": f"{S3_PREFIX}/{case_id}/{filename}"}, ExpiresIn=300)
+            st.link_button(f"📎 {filename}", url)
+            return
+        except Exception:
+            pass
+    path = os.path.join(UPLOAD_DIR, case_id, filename)
+    if os.path.exists(path):
+        with open(path, "rb") as fh:
+            st.download_button(f"📎 {filename}", fh.read(), filename, key=f"dl_{tag}_{case_id}")
+    else:
+        st.caption(f"Current document: {filename}")
+
+
+def close_case(case, user, label, remarks, doc_type, up, override):
+    outcome = REASONS[label]
+    today = str(datetime.date.today())
+    esc_level, esc_action, valid_until, needs_doc = "", "", "", outcome not in NO_DOC
+    if outcome == "Unauthorized":
+        if override and user["role"] in ADMIN_ROLES:
+            lvl = int(override)
+        else:
+            lvl = next_escalation(case["login"])[0]
+        esc_level, esc_action = str(lvl), UAL[lvl]
+        valid_until = (datetime.date.today() + datetime.timedelta(days=90)).isoformat()
+        needs_doc = lvl >= 2                    # L1 verbal coaching needs no letter
+    if needs_doc and up is None and not case.get("doc_file"):
+        return False, ("Please upload the warning letter document." if outcome == "Unauthorized"
+                       else "Please upload a supporting document.")
+    doc_file = case.get("doc_file") or ""
+    if up is not None:
+        try:
+            doc_file = save_upload(case["id"], up)
+        except Exception as e:
+            return False, f"Upload failed: {e}"
+    if outcome in NO_DOC:
+        doc_type = ""
+    execute("""UPDATE cases SET status='Closed', outcome=?, reason=?, doc_type=?, doc_file=?, closed=?,
+               closed_by=?, closedby=?, escalation_level=?, escalation_action=?,
+               ua_escalation_level=?, escalation_valid_until=? WHERE id=?""",
+            (outcome, remarks, doc_type, doc_file, today, user["alias"], user["alias"], esc_level, esc_action,
+             int(esc_level or 0), valid_until, case["id"]))
+    prev = case.get("outcome") or ""
+    if prev not in UPL_REVERSING and outcome in UPL_REVERSING:
+        execute("UPDATE upl_summary SET upl_days=MAX(0,upl_days-1) WHERE login=?", (case["login"],))
+    elif prev in UPL_REVERSING and outcome not in UPL_REVERSING:
+        execute("UPDATE upl_summary SET upl_days=upl_days+1 WHERE login=?", (case["login"],))
+    msg = f"{clean_id(case['id'])} closed: {outcome}."
+    if outcome == "Unauthorized":
+        if not query("SELECT 1 FROM ua_offences WHERE login=? AND date=?", (case["login"], today)):
+            try:
+                execute("INSERT INTO ua_offences (login,name,empid,site,date) VALUES (?,?,?,?,?)",
+                        (case["login"], case.get("name", ""), case.get("empid", ""), case.get("site", ""), today))
+            except Exception:
+                execute("INSERT INTO ua_offences (login,site,date) VALUES (?,?,?)",
+                        (case["login"], case.get("site", ""), today))
+        msg += f" Escalation: L{esc_level} - {esc_action}. Valid until {ua_for(case['login'])['valid_until']}."
+    return True, msg
+
+
+def _case_date(row):
+    for k in ("absent", "closed", "created"):
+        d = pd.to_datetime(row.get(k), errors="coerce")
+        if pd.notna(d):
+            return d.date()
+    return None
+
+
+def build_verbatim(c):
+    login, name = c["login"], c.get("name") or c["login"]
+    today = datetime.date.today()
+    hist = query("SELECT date, offence_type FROM ua_offences WHERE login=? ORDER BY date", (login,))
+    ua = ua_for(login)
+    lvl, action, _ = next_escalation(login)
+    ua_cases = query("SELECT absent, closed, created, escalation_action FROM cases "
+                     "WHERE login=? AND outcome='Unauthorized'", (login,))
+    timeline = [(h["date"], h.get("offence_type") or "Unauthorized") for h in hist]
+    seen = {t[0] for t in timeline}
+    case_dates = []
+    for x in ua_cases:
+        d = _case_date(x)
+        if d:
+            case_dates.append(d)
+            if str(d) not in seen:
+                timeline.append((str(d), x.get("escalation_action") or "Unauthorized"))
+    timeline.sort()
+    day_count = {}
+    for d in case_dates:
+        day_count[d.strftime("%A")] = day_count.get(d.strftime("%A"), 0) + 1
+    top_day = max(day_count, key=day_count.get) if day_count else "N/A"
+    wk = sum(1 for d in case_dates if d.weekday() in (6, 0, 4, 5))       # Sun, Mon, Fri, Sat
+    weekend = bool(case_dates) and wk > len(case_dates) / 2
+    cut = today - datetime.timedelta(days=183)
+    recent6 = [d for d in case_dates if d >= cut]
+    older6 = [d for d in case_dates if d < cut]
+    cur_lvl = f"L{ua['level']} ({UAL[ua['level']]})" if ua["level"] else "None (First Offence)"
+    absent = c.get("absent") or "today"
+    line = "━" * 37
+    v = f"📋 WBC COACHING VERBATIM\n{line}\n\n👤 ASSOCIATE PROFILE\n"
+    v += f"Name: {name} | Login: {login} | Site: {c.get('site') or '-'}\n"
+    v += f"Absent: {absent} | Current UA Level: {cur_lvl}\nThis Escalation: L{lvl} — {action}\n"
+    v += f"Total UA Offences on Record: {len(timeline)}" + (f" | Last Action Issued: {timeline[-1][1]}" if timeline else "") + "\n\n"
+    if timeline:
+        v += "📅 UA HISTORY (Most Recent 5)\n" + "".join(f"  • {d} — {t}\n" for d, t in reversed(timeline[-5:])) + "\n"
+    v += "📊 ABSENCE TREND (Last 6 Months)\n"
+    v += f"Total UAs in last 6 months: {len(recent6)}" + (f" (vs {len(older6)} in prior period)" if older6 else "") + "\n"
+    v += f"Most frequent absence day: {top_day}" + (f" ({day_count[top_day]}x)" if top_day in day_count else "") + "\n"
+    v += ("⚠️ Pattern: Absences cluster around weekends/weekly off days.\n" if weekend
+          else "Pattern: No clear weekend clustering observed.\n")
+    if older6 and len(recent6) > len(older6):
+        v += "📈 Trend is WORSENING — increased absences in last 6 months.\n"
+    elif older6 and len(recent6) < len(older6):
+        v += "📉 Trend IMPROVING compared to prior 6 months.\n"
+    v += f"\n💬 SUGGESTED OPENING\n{line}\n"
+    v += (f'"{name}, I appreciate you coming in today. I wanted to have a quick conversation about your attendance. '
+          f'Our records show that you were absent on {absent}. ')
+    if ua["level"] == 0:
+        v += ("This is your first unplanned absence on record, and I wanted to check in with you to understand if "
+              'everything is okay. We care about your wellbeing and want to make sure we support you where needed."\n\n')
+    else:
+        suf = "nd" if ua["level"] == 1 else "rd" if ua["level"] == 2 else "th"
+        v += (f"This is your {ua['level'] + 1}{suf} unplanned absence in the last 90 days. "
+              f'As per our attendance policy, this requires a formal {action}."\n\n')
+    if weekend:
+        v += (f"💬 PATTERN DISCUSSION\n{line}\n"
+              f'"I also want to flag that I have noticed a pattern where your absences tend to occur around {top_day}s '
+              "or near your weekly off. I want to understand if there is something we can help address — whether it is "
+              'a personal matter, transportation, or something else. Is there anything you would like to share?"\n\n')
+    v += f"💬 CLOSING\n{line}\n"
+    if lvl <= 1:
+        v += ('"I am noting this conversation as a Verbal Coaching. My expectation is that going forward, any absence '
+              "will be planned and approved in advance. If there is ever a genuine emergency, please inform your manager "
+              'as early as possible. Do you have any questions or concerns you would like to raise?"\n')
+    elif lvl <= 3:
+        v += (f'"I am issuing you a {action} today which will remain valid for 90 days. Further unplanned absences during '
+              "this period will result in escalated action. Please sign this document to acknowledge the discussion. "
+              'This is not disciplinary action — it is a support mechanism to help you improve your attendance."\n')
+    else:
+        v += (f'"I must be direct with you — we have reached L{lvl} — {action}. This is a serious concern and further '
+              "absences may result in escalation to the next level. We strongly encourage you to review your "
+              "commitments and attendance moving forward. Do you understand the seriousness of this situation and do "
+              'you have anything to add?"\n')
+    return v
+
+
+def open_case(case_id):
+    """Same as the old 'click a case': mark it In Progress, then open the work window."""
+    rows = query("SELECT status FROM cases WHERE id=?", (case_id,))
+    if rows and rows[0]["status"] == "Open":
+        execute("UPDATE cases SET status='In Progress' WHERE id=?", (case_id,))
+    case_dialog(case_id)
+
+
+@st.dialog("Case details", width="large")
+def case_dialog(case_id):
+    rows = query("SELECT * FROM cases WHERE id=?", (case_id,))
+    if not rows:
+        st.error("Case not found.")
+        return
+    c, user = rows[0], current()
+    ua = ua_for(c["login"])
+    info = [("Case ID", clean_id(c["id"])), ("Login", c["login"]), ("Employee ID", clean_id(c["empid"])),
+            ("Name", c["name"]), ("Site", c["site"]), ("Manager", c["mgr"]), ("Shift", c["shift"]),
+            ("Agency", c["agency"]), ("Attendance / absent", c["absent"]),
+            ("Current UA", f"L{ua['level']} — {UAL[ua['level']]}" if ua["count"] else "None")]
+    st.markdown('<div class="kv">' + "".join(f"<b>{esc(k)}</b><span>{esc(v) or '–'}</span>" for k, v in info) + "</div>",
+                unsafe_allow_html=True)
+
+    if c["status"] == "Closed":
+        st.success(f"Closed {c.get('closed') or ''} by {c.get('closed_by') or c.get('closedby') or '-'}: "
+                   f"{c['outcome']}" + (f" | L{c['escalation_level']} — {c['escalation_action']}" if c.get("escalation_level") else ""))
+        if c.get("reason"):
+            st.caption(f"Remarks: {c['reason']}")
+        show_existing_doc(c["id"], c.get("doc_file"), "closed")
+        if not st.checkbox("Edit / re-close this case", key=f"edit_{case_id}"):
+            return
+    elif c.get("sick_hint"):
+        st.info("💡 Roster hint: leave type indicates Sick Leave.")
+
+    labels = ["Select reason..."] + list(REASONS)
+    prev = {v: k for k, v in REASONS.items()}.get(c.get("outcome") or "", "")
+    default = labels.index(prev) if prev in labels else (labels.index("Sick Leave") if c.get("sick_hint") else 0)
+    label = st.selectbox("Reason of absence", labels, index=default, key=f"reason_{case_id}")
+    remarks = st.text_area("Remarks", value=c.get("reason") or "", key=f"remarks_{case_id}",
+                           placeholder="Add remarks about this case...")
+    if label == "Select reason...":
+        return
+
+    override, show_doc, doc_default = "", label not in NO_DOC, ""
+    if label == "Unauthorized":
+        lvl, action, valid = next_escalation(c["login"])
+        if user["role"] in ADMIN_ROLES:
+            override = st.selectbox("HRBP override (optional)", ["", "1", "2", "3", "4", "5", "6"],
+                                    format_func=lambda v: "— Keep auto level —" if not v else f"L{v} — {UAL[int(v)]}",
+                                    key=f"override_{case_id}")
+            if override:
+                lvl, action = int(override), UAL[int(override)]
+        show_doc = lvl >= 2
+        doc_default = "Warning Letter" if lvl >= 2 else ""
+        st.markdown(f'<div class="esc-box"><div class="esc-t">⚡ Auto Escalation — UA Offence</div>'
+                    f'<span class="esc-lvl">L{lvl} — {esc(action)}</span><br>Valid until: {valid}<br>'
+                    f'Required action: {esc(action)} '
+                    f'{"(No document required for Verbal Coaching)" if lvl <= 1 else "(Warning letter required)"}</div>',
+                    unsafe_allow_html=True)
+
+    doc_type, up = "", None
+    if show_doc:
+        d1, d2 = st.columns([1, 2])
+        doc_type = d1.selectbox("Document type", DOC_TYPES, key=f"dtype_{case_id}",
+                                index=DOC_TYPES.index(c["doc_type"]) if c.get("doc_type") in DOC_TYPES
+                                else DOC_TYPES.index(doc_default))
+        up = d2.file_uploader("Supporting document", type=["pdf", "jpg", "jpeg", "png", "doc", "docx"],
+                              key=f"file_{case_id}")
+        show_existing_doc(c["id"], c.get("doc_file"), "form")
+        if c.get("doc_file"):
+            st.caption("Upload a new file only if you want to replace the current one.")
+
+    if label == "Unauthorized":
+        with st.expander("🧠 Verbatim coach"):
+            if st.button("Generate verbatim", key=f"verb_btn_{case_id}"):
+                st.session_state[f"verb_{case_id}"] = build_verbatim(c)
+            if st.session_state.get(f"verb_{case_id}"):
+                st.code(st.session_state[f"verb_{case_id}"], language=None)
+
+    if st.button("✅ Close Case", type="primary", key=f"close_{case_id}"):
+        ok, msg = close_case(c, user, label, remarks, doc_type, up, override)
+        if ok:
+            st.session_state["_flash"] = msg
+            st.rerun()
+        else:
+            st.error(msg)
 
 
 def cases_table(view):
@@ -449,7 +764,7 @@ def cases_table(view):
             with c[6]:
                 with st.container(key=f"view_{cur}_{n}"):
                     if st.button("👁 View", key=f"viewbtn_{cur}_{n}"):
-                        show_case(r.to_dict())
+                        open_case(r["id"])
 
     first, last = (start + 1 if total else 0), min(start + PAGE_SIZE, total)
     with st.container(key="pager"):
