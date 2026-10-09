@@ -51,7 +51,7 @@ def init_db():
               
     conn.commit()
     
-    # AUTO-IMPORT EXCEL FILE PROPERLY
+    # FLEXIBLE AUTO-IMPORT EXCEL FILE USING SUBSTRING MATCHING
     count = c.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
     if count == 0:
         excel_files = [f for f in os.listdir('.') if f.endswith('.xlsx') or f.endswith('.xls')]
@@ -59,28 +59,28 @@ def init_db():
             try:
                 file_path = excel_files[0]
                 df = pd.read_excel(file_path)
-                # Normalize column names to lowercase/stripped to avoid mismatch
-                df.columns = [str(col).strip().lower() for col in df.columns]
                 
                 for _, row in df.iterrows():
-                    # Helper to safely fetch values from various possible column header names
-                    def get_val(keys, default=""):
-                        for k in keys:
-                            if k in df.columns and pd.notna(row[k]):
-                                return str(row[k])
-                        return default
+                    row_dict = {str(k).strip().lower(): v for k, v in row.items() if pd.notna(v)}
+                    
+                    def find_by_sub(sub_list):
+                        for col in row_dict.keys():
+                            for sub in sub_list:
+                                if sub in col:
+                                    return str(row_dict[col])
+                        return ""
 
-                    case_id = get_val(['id', 'case_id', 'case id'], f"AUTO-{datetime.datetime.now().timestamp()}")
-                    login = get_val(['login', 'username', 'user'], 'unknown')
-                    empid = get_val(['empid', 'emp_id', 'employee id', 'id'])
-                    name = get_val(['name', 'employee name', 'full name'])
-                    site = get_val(['site', 'location', 'facility'])
-                    mgr = get_val(['mgr', 'manager', 'supervisor'])
-                    shift = get_val(['shift', 'timing'])
-                    agency = get_val(['agency', 'vendor'])
-                    absent = get_val(['absent', 'absence_date', 'date'])
-                    created = get_val(['created', 'date', 'created_at'], str(datetime.date.today()))
-                    status = get_val(['status'], 'Open')
+                    case_id = find_by_sub(['case_id', 'id']) or f"AUTO-{datetime.datetime.now().timestamp()}"
+                    login = find_by_sub(['login', 'user', 'alias']) or 'unknown'
+                    empid = find_by_sub(['empid', 'emp_id', 'employee'])
+                    name = find_by_sub(['name', 'worker'])
+                    site = find_by_sub(['site', 'loc', 'location'])
+                    mgr = find_by_sub(['mgr', 'manager', 'supervisor'])
+                    shift = find_by_sub(['shift'])
+                    agency = find_by_sub(['agency', 'vendor'])
+                    absent = find_by_sub(['absent', 'absence'])
+                    created = find_by_sub(['created', 'date']) or str(datetime.date.today())
+                    status = find_by_sub(['status']) or 'Open'
                     
                     c.execute('''INSERT OR REPLACE INTO cases (
                         id, login, empid, name, site, mgr, shift, agency, absent, created, status
@@ -140,7 +140,6 @@ if not current_user:
 st.sidebar.title(f"👤 Welcome, {current_user['alias'].upper()}")
 st.sidebar.markdown(f"**Role:** {current_user['role']} | **Sites:** {current_user['sites']}")
 
-# Add a button to reset/re-import database if needed
 if st.sidebar.button("🔄 Refresh Data from Excel"):
     if os.path.exists("wbc.db"):
         os.remove("wbc.db")
