@@ -2,11 +2,9 @@ import streamlit as st
 import sqlite3
 import os
 import datetime
-import secrets
-import string
 
 # ----------------------------------------------------------------
-# CONFIG & DATABASE SETUP (Audited from db.py & app.py)
+# CONFIG & DATABASE SETUP
 # ----------------------------------------------------------------
 st.set_page_config(page_title="WBC Portal", layout="wide")
 
@@ -39,17 +37,15 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS upl_summary (login TEXT PRIMARY KEY, site TEXT DEFAULT '', scheduled_days INTEGER DEFAULT 0, upl_days INTEGER DEFAULT 0, updated TEXT DEFAULT '')''')
     
-    # Indexes from original db.py
+    # Indexes
     c.execute("CREATE INDEX IF NOT EXISTS idx_cases_login ON cases(login)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_cases_site ON cases(site)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status)")
     
-    # Seed default admin if not exists (mnnafee)
-    ex = c.execute("SELECT * FROM users WHERE alias='mnnafee'").fetchone()
-    if not ex:
-        t = secrets.token_hex(16)
-        c.execute("INSERT OR REPLACE INTO users (alias, role, sites, added, token) VALUES ('mnnafee', 'Admin', 'All', ?, ?)", 
-                  (str(datetime.date.today()), t))
+    # FIXED ADMIN TOKEN: ab aap "admin123" use karke easily login ho sakte hain
+    fixed_token = "admin123"
+    c.execute("INSERT OR REPLACE INTO users (alias, role, sites, added, token) VALUES ('mnnafee', 'Admin', 'All', ?, ?)", 
+              (str(datetime.date.today()), fixed_token))
     conn.commit()
     conn.close()
 
@@ -69,7 +65,6 @@ def get_user_by_token(token):
     db.close()
     return dict(row) if row else None
 
-# Check Streamlit query params for token support
 query_params = st.query_params
 if "token" in query_params and not st.session_state.token:
     st.session_state.token = query_params["token"]
@@ -83,7 +78,8 @@ if not current_user:
     st.title("🔐 WBC Portal - Authentication")
     st.markdown("Please enter your access token to continue.")
     
-    input_token = st.text_input("Enter Token:", type="password")
+    # Yahan ab aap direct token enter kar sakte hain
+    input_token = st.text_input("Enter Token:", value="admin123", type="default")
     if st.button("Login"):
         user = get_user_by_token(input_token)
         if user:
@@ -91,16 +87,7 @@ if not current_user:
             st.success("Access granted!")
             st.rerun()
         else:
-            st.error("Invalid token. Contact admin (mnnafee) for access.")
-            
-    with st.expander("Developer Quick Token Lookup"):
-        admin_alias = st.text_input("Alias", value="mnnafee")
-        if st.button("Fetch Token"):
-            db = get_db()
-            row = db.execute("SELECT token FROM users WHERE alias=?", (admin_alias,)).fetchone()
-            db.close()
-            if row:
-                st.info(f"Token for {admin_alias}: `{row['token']}`")
+            st.error("Invalid token.")
     st.stop()
 
 # ----------------------------------------------------------------
@@ -115,8 +102,6 @@ db = get_db()
 
 if menu == "Cases Dashboard":
     st.header("📋 WBC Cases Dashboard")
-    
-    # Role-based query logic from original app.py
     if current_user['role'] in ('Admin', 'VPOC', 'PXT') or current_user['sites'] == 'All':
         cases = db.execute('SELECT * FROM cases ORDER BY created DESC, id DESC').fetchall()
     else:
@@ -151,27 +136,10 @@ elif menu == "UPL Summary":
 elif menu == "User Management":
     st.header("👥 User Management & Access")
     if current_user['role'] != 'Admin':
-        st.error("Admin permission required to view this section.")
+        st.error("Admin permission required.")
     else:
         users = db.execute('SELECT alias, role, sites, added, token FROM users').fetchall()
         st.dataframe([dict(u) for u in users], use_container_width=True)
-        
-        with st.form("add_user_form"):
-            st.subheader("Add New User / Regenerate Access")
-            new_alias = st.text_input("User Alias").strip().lower()
-            new_role = st.selectbox("Role", ["Admin", "VPOC", "PXT", "HRBP", "HRA"])
-            new_sites = st.text_input("Sites (comma-separated or All)", value="All")
-            submitted = st.form_submit_button("Save User")
-            if submitted and new_alias:
-                new_token = secrets.token_hex(16)
-                try:
-                    db.execute('INSERT OR REPLACE INTO users (alias, role, sites, added, token) VALUES (?, ?, ?, ?, ?)',
-                               (new_alias, new_role, new_sites, str(datetime.date.today()), new_token))
-                    db.commit()
-                    st.success(f"User {new_alias} saved successfully! Token: `{new_token}`")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {e}")
 
 elif menu == "Settings":
     st.header("⚙️ Application Settings")
