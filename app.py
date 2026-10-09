@@ -169,14 +169,25 @@ h1,h2,h3{color:var(--navy);}
   background:#fff;color:#475569;font-size:.76rem;}
 [class*="st-key-pager"] button[data-testid="stBaseButton-primary"]{background:var(--blue);border-color:var(--blue);color:#fff;}
 
+/* ---------- clickable stat chips (dashboard) ---------- */
+[class*="st-key-chip_"] button{background:linear-gradient(135deg,#9a88f7,#7b6be8);border:none;color:#fff;border-radius:10px;
+  min-height:38px;box-shadow:0 4px 12px rgba(123,107,232,.26);}
+[class*="st-key-chip_"] button *{color:#fff !important;font-size:.78rem;font-weight:600;}
+[class*="st-key-chip_"] button strong{background:rgba(255,255,255,.24);padding:1px 9px;border-radius:7px;margin-left:6px;}
+[class*="st-key-chip_"] button:hover{filter:brightness(1.07);}
+[class*="st-key-chip_"] button[data-testid="stBaseButton-primary"]{background:linear-gradient(135deg,#5b49c9,#4636b0);
+  box-shadow:0 0 0 3px rgba(123,107,232,.35),0 4px 12px rgba(91,73,201,.35);}
+
 /* ---------- CSV / Excel export buttons ---------- */
 [class*="st-key-dl_csv"] button, .st-key-dl_ua button, .st-key-dl_upl button{
-  background:#fff;border:1.5px solid #5b8def;color:#2563eb;border-radius:12px;font-weight:600;min-height:44px;}
+  background:#fff;border:1.5px solid #5b8def;color:#2563eb;border-radius:10px;font-weight:600;font-size:.78rem;min-height:34px;padding:0 10px;}
 [class*="st-key-dl_csv"] button:hover, .st-key-dl_ua button:hover, .st-key-dl_upl button:hover{
   background:#eff5ff;border-color:#2563eb;color:#1d4ed8;}
 [class*="st-key-dl_csv"] button *, .st-key-dl_ua button *, .st-key-dl_upl button *{color:#2563eb !important;}
 [class*="st-key-dl_xlsx"] button{background:linear-gradient(135deg,#12a58c,#0b7a6a);border:none;color:#fff;
-  border-radius:12px;font-weight:600;min-height:44px;box-shadow:0 4px 12px rgba(15,157,132,.28);}
+  border-radius:10px;font-weight:600;font-size:.78rem;min-height:34px;padding:0 10px;box-shadow:0 3px 8px rgba(15,157,132,.25);}
+[class*="st-key-dl_csv"] button p, [class*="st-key-dl_xlsx"] button p, .st-key-dl_ua button p, .st-key-dl_upl button p{
+  font-size:.78rem;margin:0;}
 [class*="st-key-dl_xlsx"] button:hover{filter:brightness(1.08);color:#fff;}
 [class*="st-key-dl_xlsx"] button *{color:#fff !important;}
 
@@ -905,6 +916,11 @@ def set_page(p):
     st.session_state.cases_page = p
 
 
+def set_chip(k):
+    """Clicking a stat chip filters the case list; clicking the active chip again shows everything."""
+    st.session_state["dash_chip"] = "total" if st.session_state.get("dash_chip", "total") == k else k
+
+
 # ----------------------------------------------------------------
 # CASE WORKFLOW  (remarks, authorized / unauthorized, escalation, warning letter, verbatim)
 # ----------------------------------------------------------------
@@ -1261,10 +1277,21 @@ def page_dashboard():
 
     g = df["_g"]
     pending = ~g.isin(["open", "closed"])
-    st.markdown(chips_html([
-        ("Total Cases", len(df)), ("Open Cases", int(df["_open"].sum())),
-        ("Closed Cases", int((g == "closed").sum())), ("Pending Cases", int(pending.sum())),
-        ("Pending > 5 Days", int((pending & (df["_days"] > 5)).sum()))]), unsafe_allow_html=True)
+    chip_defs = [("total", "Total Cases", pd.Series(True, index=df.index)),
+                 ("open", "Open Cases", df["_open"]),
+                 ("closed", "Closed Cases", g == "closed"),
+                 ("pending", "Pending Cases", pending),
+                 ("pending5", "Pending > 5 Days", pending & (df["_days"] > 5))]
+    active = st.session_state.get("dash_chip", "total")
+    if active not in {k for k, _, _ in chip_defs}:
+        active = "total"
+    for col, (k, label, mask) in zip(st.columns([1, 1, 1, 1, 1.2, 2.6]), chip_defs):
+        with col:
+            with st.container(key=f"chip_{k}"):
+                st.button(f"✦ {label}  **{int(mask.sum())}**", key=f"chipbtn_{k}",
+                          type="primary" if k == active else "secondary",
+                          on_click=set_chip, args=(k,), use_container_width=True)
+    base = df[{k: m for k, _, m in chip_defs}[active]]          # the chip picked above filters the case list
 
     left, right = st.columns([2.35, 1], gap="medium")
     with left:
@@ -1275,7 +1302,7 @@ def page_dashboard():
                                    label_visibility="collapsed", key="q_search")
 
             f1, f2, f3, f4, f5 = st.columns([1, 0.8, 1.2, 1.1, 0.9])
-            view = site_filters(df, "dash", [f1, f2, f3])
+            view = site_filters(base, "dash", [f1, f2, f3])
             view = agency_filter(view, "dash_agency", f4)
             size = int(f5.selectbox("Rows per page", [8, 25, 50, 100, 200], key="q_size",
                                     format_func=lambda n: f"{n} / page", label_visibility="collapsed"))
@@ -1285,8 +1312,8 @@ def page_dashboard():
                 hay = (view["id"] + " " + view["site"] + " " + view["_type"] + " " + view["name"] + " " + view["login"] + " " + view["agency"]).str.lower()
                 view = view[hay.str.contains(s, regex=False)]
 
-            bar1, bar2, bar3 = st.columns([3, 1, 1], vertical_alignment="center")
-            bar1.markdown(f'<div class="showing">{len(view)} cases match - downloads include all of them, not just this page</div>',
+            bar1, bar2, bar3 = st.columns([7, 1, 1], vertical_alignment="center")
+            bar1.markdown(f'<div class="showing" style="padding-top:0">{len(view)} cases match - downloads include all of them, not just this page</div>',
                           unsafe_allow_html=True)
             export = view[CASE_COLS]
             bar2.download_button("⬇ CSV", export.to_csv(index=False).encode(), "wbc_cases.csv", "text/csv",
@@ -1297,7 +1324,7 @@ def page_dashboard():
                                      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                      key="dl_xlsx_dash", use_container_width=True)
 
-            sig = (search, tuple(st.session_state.get(f"dash_{k}") for k in ("country", "bu", "site", "agency")), size)
+            sig = (search, tuple(st.session_state.get(f"dash_{k}") for k in ("country", "bu", "site", "agency")), size, active)
             if st.session_state.get("_sig") != sig:
                 st.session_state["_sig"] = sig
                 st.session_state.cases_page = 1
