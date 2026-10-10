@@ -1,17 +1,22 @@
 import streamlit as st
-import sqlite3
-import os
 import io
-import csv
+import re
 import copy
 import math
-import shutil
-import hashlib
-import re
-import tempfile
+import json
 import datetime
 import html as _html
+from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
+
+try:                                                  # same pattern as the other Canopy tool: plain boto3 + IAM role
+    import boto3
+    from botocore.exceptions import ClientError, NoCredentialsError
+    _boto3_installed = True
+except ImportError:
+    boto3 = None
+    ClientError = NoCredentialsError = Exception
+    _boto3_installed = False
 
 # ----------------------------------------------------------------
 # PAGE CONFIG
@@ -19,7 +24,27 @@ import pandas as pd
 st.set_page_config(page_title="WBC Portal", page_icon="🛡️", layout="wide",
                    initial_sidebar_state="expanded")
 
-DB_PATH = os.environ.get("WBC_DB_PATH", "wbc.db")
+# ----------------------------------------------------------------
+# CANOPY STORAGE (S3) - the ONLY storage this app uses
+#   s3://<S3_BUCKET>/<S3_PREFIX><FOLDER>/<daily file>.xlsx     e.g. javmuhak/wbc/DXB5/DMD-DXB5-09102026.xlsx
+#   s3://<S3_BUCKET>/<S3_PREFIX>_state/...                      cases worked, UA offences, users, custom sites (JSON)
+#   s3://<S3_BUCKET>/<S3_PREFIX>_uploads/<case id>/<file>       warning letters / medical certificates
+# Credentials come from the container's IAM role - nothing is hard-coded.
+# ----------------------------------------------------------------
+S3_BUCKET = "canopy-app-data-prod-796301651950"
+S3_PREFIX = "javmuhak/wbc/"
+STATE_DIR = "_state"
+UPLOAD_DIR = "_uploads"
+LOOKBACK_DAYS = 45                       # daily files older than this are not read (closed cases are always kept)
+
+# Which sites live in which storage folder. A folder you create later is picked up automatically
+# (its sites are read from the files); add it here only if you want the site list shown before it has data.
+SITE_FOLDERS = {
+    "DXB5": ["DUF7", "DUF8", "DWC3", "DXB5", "DXB6", "DXB8", "DXF2", "XAEC"],
+    "AUH1": ["AUH1", "DAD1", "AUH3"],
+    "DXB3": [],                          # remaining sites - add them here when you decide
+}
+
 PAGE_SIZE = 8
 USER_MGMT_BYPASS = {"javmuhak"}                                   # aliases that can open User Management without being Admin
 TOP_N_SITES = 3                                                 # Cases by Site + mountain chart show this many
@@ -36,15 +61,20 @@ DOC_TYPES = ["", "Medical Certificate", "HRBP Approval", "Warning Letter", "Emai
 ADMIN_ROLES = ("admin", "hrbp")                                   # lower-case; can override escalation level
 EXCLUDED_ATTENDANCE = {"P", "OFF"}                                # present / weekly-off rows are not WBC cases
 ALL_ACCESS_ROLES = ("admin", "vpoc", "pxt")                       # see every site
-UPLOAD_DIR = os.environ.get("WBC_UPLOAD_DIR", "wbc_uploads")
-S3_BUCKET = os.environ.get("WBC_S3_BUCKET", "")                   # optional: upload to S3 instead
-S3_PREFIX = os.environ.get("WBC_S3_PREFIX", "wbc-uploads")
 
 CASE_COLS = ["id", "login", "empid", "name", "site", "mgr", "shift", "agency", "absent",
              "created", "status", "outcome", "reason", "doc_type", "doc_file", "notes",
              "closed", "source", "sick_hint", "ua_escalation_level",
              "escalation_valid_until", "closedby", "on_site", "closed_by",
-             "escalation_level", "escalation_action", "present_status"]
+             "escalation_level", "escalation_action", "present_status", "folder"]
+
+# fields a user changes while working a case - these are what gets saved to storage
+WORKFLOW_KEYS = ["status", "outcome", "reason", "doc_type", "doc_file", "notes", "closed", "closedby", "closed_by",
+                 "escalation_level", "escalation_action", "ua_escalation_level", "escalation_valid_until",
+                 "present_status"]
+
+DEFAULT_USERS = [{"alias": "mnnafee", "role": "Admin", "sites": "All"},
+                 {"alias": "javmuhak", "role": "VPOC", "sites": "All"}]
 
 # ----------------------------------------------------------------
 # SITE MAP  (ported from the old portal: Country -> BU -> Sites)
@@ -68,7 +98,6 @@ SITE_MAP_DEFAULT = {
 }
 COUNTRY_LABELS = {"ARE": "UAE", "EGY": "Egypt", "SAU": "KSA", "TUR": "Turkiye"}
 COUNTRY_FLAGS = {"ARE": "🇦🇪", "EGY": "🇪🇬", "SAU": "🇸🇦", "TUR": "🇹🇷"}
-TARGET_SITES = ["AUH1", "AUH3", "DAD1", "DWC3", "DWC5", "DXB3", "DXB5", "DXB8"]   # DWD sync default
 
 
 # ----------------------------------------------------------------
@@ -107,8 +136,8 @@ h1,h2,h3{color:var(--navy);}
 .side-foot{position:fixed;left:24px;bottom:28px;font-size:.95rem;line-height:1.35;font-weight:500;
   background:linear-gradient(90deg,#3b5bdb,#7c5cff);-webkit-background-clip:text;background-clip:text;color:transparent;}
 .side-foot span{display:block;width:28px;height:2px;margin-top:7px;background:#6366f1;border-radius:2px;}
-.st-key-signout button{background:transparent;border:1px solid var(--line);color:var(--muted);
-  border-radius:10px;font-size:.8rem;margin-top:12px;}
+.st-key-signout button, .st-key-refresh button{background:transparent;border:1px solid var(--line);color:var(--muted);
+  border-radius:10px;font-size:.8rem;margin-top:8px;}
 
 /* ---------- top bar ---------- */
 .topbar{display:flex;justify-content:space-between;align-items:center;margin:0 0 10px;}
@@ -328,6 +357,166 @@ def pill_html(group, label):
     return f'<span class="pill {cls}">{esc(label)}</span>'
 
 
+def to_excel_bytes(df, sheet="Cases"):
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name=sheet)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+# ----------------------------------------------------------------
+# S3 LAYER  (connection pattern copied from the Workforce Compliance tool already running on Canopy)
+# ----------------------------------------------------------------
+@st.cache_resource(ttl=120, show_spinner=False)
+def _s3_connect():
+    """(client, message). client is None when S3 cannot be reached. Re-checked every 2 minutes."""
+    if not _boto3_installed:
+        return None, "boto3 is not installed - add boto3 to requirements.txt"
+    try:
+        client = boto3.client("s3")
+        resp = client.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_PREFIX, MaxKeys=1)
+        return client, f"S3 OK - found {resp.get('KeyCount', 0)} objects"
+    except NoCredentialsError as e:
+        return None, f"No credentials: {e}"
+    except ClientError as e:
+        return None, f"Client error: {e}"
+    except Exception as e:
+        return None, f"Unknown error: {type(e).__name__}: {e}"
+
+
+def s3_client():
+    return _s3_connect()[0]
+
+
+def s3_status():
+    client, msg = _s3_connect()
+    return {"connected": client is not None, "bucket": S3_BUCKET, "prefix": S3_PREFIX, "message": msg}
+
+
+def _key(rel):
+    return S3_PREFIX + str(rel).replace("\\", "/").lstrip("/")
+
+
+def _is_missing(e):
+    code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+    return code in ("NoSuchKey", "404", "NotFound")
+
+
+def s3_read(rel, client=None):
+    """Bytes of an object, or None if it does not exist. Other errors are raised."""
+    c = client or s3_client()
+    if c is None:
+        raise RuntimeError("S3 is not connected")
+    try:
+        return c.get_object(Bucket=S3_BUCKET, Key=_key(rel))["Body"].read()
+    except ClientError as e:
+        if _is_missing(e):
+            return None
+        raise
+
+
+def s3_write(rel, data, content_type=None):
+    c = s3_client()
+    if c is None:
+        raise RuntimeError("S3 is not connected")
+    extra = {"ContentType": content_type} if content_type else {}
+    c.put_object(Bucket=S3_BUCKET, Key=_key(rel), Body=data, **extra)
+
+
+def s3_list(rel_prefix="", client=None):
+    """Every object under S3_PREFIX + rel_prefix -> [{key (relative), size, modified, etag}]."""
+    c = client or s3_client()
+    if c is None:
+        raise RuntimeError("S3 is not connected")
+    out = []
+    for page in c.get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET, Prefix=S3_PREFIX + rel_prefix):
+        for o in page.get("Contents", []):
+            rel = o["Key"][len(S3_PREFIX):]
+            if rel and not rel.endswith("/"):
+                out.append({"key": rel, "size": o["Size"], "modified": o["LastModified"], "etag": o.get("ETag", "")})
+    return out
+
+
+def s3_folders(client=None):
+    """Data folders directly under the prefix (AUH1, DXB3, DXB5, ... - anything not starting with _ or .)."""
+    c = client or s3_client()
+    if c is None:
+        raise RuntimeError("S3 is not connected")
+    names = []
+    for page in c.get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET, Prefix=S3_PREFIX, Delimiter="/"):
+        for p in page.get("CommonPrefixes", []):
+            n = p["Prefix"][len(S3_PREFIX):].strip("/")
+            if n and not n.startswith(("_", ".")):
+                names.append(n)
+    return sorted(names)
+
+
+def _clean(v):
+    if v is None:
+        return ""
+    if isinstance(v, float) and math.isnan(v):
+        return ""
+    if hasattr(v, "item"):
+        try:
+            return v.item()
+        except Exception:
+            pass
+    return v
+
+
+def _json_default(o):
+    if isinstance(o, (datetime.date, datetime.datetime, pd.Timestamp)):
+        return str(o)[:10]
+    if hasattr(o, "item"):
+        try:
+            return o.item()
+        except Exception:
+            pass
+    return str(o)
+
+
+def read_json(rel, default=None):
+    data = s3_read(rel)
+    if data is None:
+        return default
+    try:
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        return default
+
+
+def write_json(rel, obj):
+    s3_write(rel, json.dumps(obj, ensure_ascii=False, default=_json_default).encode("utf-8"), "application/json")
+
+
+def _safe(s):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s)).strip("_") or "x"
+
+
+def _read_many(rels, client):
+    def one(rel):
+        try:
+            data = s3_read(rel, client)
+            return json.loads(data.decode("utf-8")) if data else None
+        except Exception:
+            return None
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return list(ex.map(one, rels))
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_state_records(prefix):
+    """All small JSON records under a state folder (one file per case / UA offence, so people never overwrite each other)."""
+    c = s3_client()
+    if c is None:
+        return []
+    rels = [o["key"] for o in s3_list(prefix, c) if o["key"].endswith(".json")]
+    return [r for r in _read_many(rels, c) if isinstance(r, dict)]
+
+
 # ----------------------------------------------------------------
 # ACCESS HELPERS
 # ----------------------------------------------------------------
@@ -352,16 +541,6 @@ def is_admin(user):
 
 def is_admin_role(user):
     return str(user.get("role", "")).lower() in ADMIN_ROLES or is_admin(user)
-
-
-def to_excel_bytes(df, sheet="Cases"):
-    try:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            df.to_excel(w, index=False, sheet_name=sheet)
-        return buf.getvalue()
-    except Exception:
-        return None
 
 
 # ----------------------------------------------------------------
@@ -394,182 +573,324 @@ def prepare(df):
 
 
 # ----------------------------------------------------------------
-# DATABASE
+# DAILY FILES -> CASES  (read straight from Canopy storage)
 # ----------------------------------------------------------------
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+ROSTER_FIELDS = {                          # normalised header names (lower-case, letters+digits only)
+    "name": ("empname", "employeename", "name"),
+    "amz": ("amzid", "login", "alias", "amazonid"),
+    "psoft": ("psoftno", "psoft", "psoftid", "employeeid", "empid"),
+    "site": ("building", "site", "warehouse"),
+    "mgr": ("linemanager", "manager", "managername", "mgr"),
+    "shift": ("shift",),
+    "agency": ("3p", "agency", "vendor"),
+    "att": ("attendance", "attendence"),            # the AUH1 file spells it "Attendence"
+}
+ROW_COLS = ["empid", "login", "name", "site", "mgr", "shift", "agency", "att", "date", "folder"]
 
 
-def ensure_columns(c, table, cols):
-    have = {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
-    for col, ddl in cols.items():
-        if col not in have:
-            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+def _norm(v):
+    return re.sub(r"[^a-z0-9]", "", str(v).lower())
 
 
-def init_db():
-    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)) if os.path.dirname(os.path.abspath(DB_PATH)) else '.', exist_ok=True)
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS cases (
-        id TEXT PRIMARY KEY, login TEXT NOT NULL, empid TEXT, name TEXT,
-        site TEXT, mgr TEXT, shift TEXT, agency TEXT, absent TEXT, created TEXT,
-        status TEXT DEFAULT "Open", outcome TEXT DEFAULT "", reason TEXT DEFAULT "",
-        doc_type TEXT DEFAULT "", doc_file TEXT DEFAULT "", notes TEXT DEFAULT "",
-        closed TEXT DEFAULT "", source TEXT DEFAULT "csv", sick_hint INTEGER DEFAULT 0,
-        ua_escalation_level INTEGER DEFAULT 0, escalation_valid_until TEXT DEFAULT "",
-        closedby TEXT DEFAULT "", on_site TEXT DEFAULT "")''')
-    c.execute('''CREATE TABLE IF NOT EXISTS ua_offences (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, login TEXT NOT NULL, name TEXT DEFAULT "",
-        empid TEXT DEFAULT "", site TEXT, date TEXT NOT NULL,
-        offence_type TEXT DEFAULT "")''')
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        alias TEXT PRIMARY KEY, role TEXT NOT NULL, sites TEXT DEFAULT "All",
-        added TEXT, token TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS upl_summary (login TEXT PRIMARY KEY, site TEXT DEFAULT '', scheduled_days INTEGER DEFAULT 0, upl_days INTEGER DEFAULT 0, updated TEXT DEFAULT '')''')
-    c.execute('''CREATE TABLE IF NOT EXISTS access_requests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, alias TEXT, name TEXT, email TEXT,
-        country TEXT, bu TEXT, sites TEXT, role TEXT, status TEXT DEFAULT "pending",
-        requested_at TEXT DEFAULT '', reviewed_by TEXT, reviewed_at TEXT,
-        reject_reason TEXT DEFAULT "")''')
-    c.execute('''CREATE TABLE IF NOT EXISTS custom_sites (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        country TEXT NOT NULL, bu TEXT NOT NULL, site TEXT NOT NULL,
-        active INTEGER DEFAULT 1, added_by TEXT, added_at TEXT,
-        UNIQUE(country, bu, site))''')
+def _s(v):
+    if v is None:
+        return ""
+    t = str(v).strip()
+    return "" if t.lower() in ("nan", "none", "nat") else t
 
-    # columns used by the case-close flow / old portal schema (safe, idempotent)
-    ensure_columns(c, "cases", {
-        "closed_by": "TEXT DEFAULT ''", "escalation_level": "TEXT DEFAULT ''",
-        "escalation_action": "TEXT DEFAULT ''", "present_status": "TEXT DEFAULT ''",
-        "ua_escalation_level": "INTEGER DEFAULT 0", "escalation_valid_until": "TEXT DEFAULT ''",
-        "closedby": "TEXT DEFAULT ''", "on_site": "TEXT DEFAULT ''"})
-    ensure_columns(c, "ua_offences", {"offence_type": "TEXT DEFAULT ''", "name": "TEXT DEFAULT ''",
-                                      "empid": "TEXT DEFAULT ''"})
-    ensure_columns(c, "users", {"token": "TEXT", "added": "TEXT"})
 
-    # Indexes
-    c.execute("CREATE INDEX IF NOT EXISTS idx_cases_login ON cases(login)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_cases_site ON cases(site)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_cases_created ON cases(created)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_ua_login ON ua_offences(login)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_ua_site ON ua_offences(site)")
+def file_date(name):
+    """DWD-AUH1-09102026.xlsx -> 2026-10-09 (day, month, year)."""
+    m = re.search(r"(\d{8})", name)
+    if not m:
+        return None
+    try:
+        return datetime.datetime.strptime(m.group(1), "%d%m%Y").date()
+    except ValueError:
+        return None
 
-    # Seed default users - IGNORE (not REPLACE) so imported users / tokens are never overwritten
-    c.execute("INSERT OR IGNORE INTO users (alias, role, sites, added, token) VALUES ('mnnafee', 'Admin', 'All', ?, 'mnnafee')",
-              (str(datetime.date.today()),))
-    c.execute("INSERT OR IGNORE INTO users (alias, role, sites, added, token) VALUES ('javmuhak', 'VPOC', 'All', ?, 'javmuhak')",
-              (str(datetime.date.today()),))
-    conn.commit()
 
-    # ONE-TIME AUTO-IMPORT FROM 'Roster' SHEET OF EXCEL (only into an empty database, only once)
-    count = c.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
-    done = c.execute("SELECT 1 FROM settings WHERE key='excel_imported'").fetchone()
-    if count == 0 and not done:
-        excel_files = [f for f in os.listdir('.') if f.endswith('.xlsx') or f.endswith('.xls')]
-        if excel_files:
+def parse_roster_bytes(data, folder, fdate):
+    """One daily .xlsx -> one row per employee (Roster sheet; header row is found by looking for EMP Name / AMZ ID)."""
+    xls = pd.ExcelFile(io.BytesIO(data))
+    sheet = xls.sheet_names[0]
+    if "Roster" in xls.sheet_names:
+        sheet = "Roster"
+    else:
+        for sn in xls.sheet_names:
+            if any(w in sn.lower() for w in ("roster", "employee", "staff")):
+                sheet = sn
+                break
+    raw = xls.parse(sheet, header=None, dtype=str)
+    if raw.empty:
+        return pd.DataFrame(columns=ROW_COLS)
+    hdr = 0
+    for i in range(min(15, len(raw))):
+        vals = {_norm(v) for v in raw.iloc[i].tolist() if pd.notna(v)}
+        if vals & {"empname", "amzid", "sno"}:
+            hdr = i
+            break
+    heads, seen = [], {}
+    for j, v in enumerate(raw.iloc[hdr].tolist()):
+        h = (_norm(v) if pd.notna(v) else "") or f"col{j}"
+        if h in seen:
+            seen[h] += 1
+            h = f"{h}_{seen[h]}"
+        else:
+            seen[h] = 0
+        heads.append(h)
+    df = raw.iloc[hdr + 1:].copy()
+    df.columns = heads
+    df = df.reset_index(drop=True)
+
+    def pick(field):
+        for cand in ROSTER_FIELDS[field]:
+            if cand in df.columns:
+                return df[cand].map(_s)
+        return pd.Series([""] * len(df), index=df.index, dtype=object)
+
+    empid = pick("psoft").map(clean_id)
+    login = pick("amz").map(clean_id).str.lower()
+    login = login.where(login != "", empid)
+    site = pick("site")
+    site = site.where(site != "", folder)
+    out = pd.DataFrame({"empid": empid, "login": login, "name": pick("name"), "site": site,
+                        "mgr": pick("mgr"), "shift": pick("shift"), "agency": pick("agency"),
+                        "att": pick("att").str.upper()})
+    out = out[((out["login"] != "") | (out["name"] != "")) & (out["att"] != "")].copy()
+    out["date"] = fdate.isoformat()
+    out["folder"] = folder
+    return out[ROW_COLS].reset_index(drop=True)
+
+
+@st.cache_resource(show_spinner=False)
+def _parse_store():
+    """Parsed files, kept between reruns so only NEW or CHANGED files are downloaded again."""
+    return {}
+
+
+@st.cache_data(ttl=300, show_spinner="Loading cases from Canopy storage...")
+def load_roster(lookback_days):
+    """Every employee-day from the daily files of the last `lookback_days` days, across all storage folders."""
+    info = {"folders": {}, "files": 0, "rows": 0, "warnings": []}
+    client = s3_client()
+    if client is None:
+        info["warnings"].append("S3 is not connected.")
+        return pd.DataFrame(columns=ROW_COLS), info
+    cutoff = now_local().date() - datetime.timedelta(days=lookback_days)
+    try:
+        folders = s3_folders(client)
+    except Exception as e:
+        info["warnings"].append(f"Could not list storage folders: {type(e).__name__}: {e}")
+        return pd.DataFrame(columns=ROW_COLS), info
+
+    jobs = []
+    for folder in folders:
+        meta = info["folders"].setdefault(folder, {"total": 0, "loaded": 0, "latest": ""})
+        try:
+            objs = s3_list(folder + "/", client)
+        except Exception as e:
+            info["warnings"].append(f"{folder}/: {type(e).__name__}: {e}")
+            continue
+        for o in objs:
+            name = o["key"].rsplit("/", 1)[-1]
+            if not name.lower().endswith(".xlsx") or name.startswith("~$"):
+                continue
+            meta["total"] += 1
+            fd = file_date(name)
+            if fd is None or fd < cutoff:
+                continue
+            jobs.append((o, folder, fd))
+    jobs.sort(key=lambda j: j[0]["modified"])                    # if two files share a date, the newest upload wins
+
+    store = _parse_store()
+
+    def work(job):
+        o, folder, fd = job
+        ck = (o["key"], o["etag"])
+        if ck in store:
+            return store[ck], None
+        try:
+            data = s3_read(o["key"], client)
+            if data is None:
+                return None, f"{o['key']}: file not found"
+            df = parse_roster_bytes(data, folder, fd)
+            store[ck] = df
+            return df, None
+        except Exception as e:
+            return None, f"{o['key']}: {type(e).__name__}: {e}"
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        results = list(ex.map(work, jobs))
+
+    live = {(o["key"], o["etag"]) for o, _, _ in jobs}
+    for k in [k for k in list(store) if k not in live]:
+        store.pop(k, None)
+
+    frames = []
+    for (o, folder, fd), (df, err) in zip(jobs, results):
+        if err:
+            info["warnings"].append(err)
+            continue
+        if df is None or df.empty:
+            info["warnings"].append(f"{o['key']}: no readable rows (check the Roster sheet and the Attendance column)")
+            continue
+        frames.append(df)
+        meta = info["folders"][folder]
+        meta["loaded"] += 1
+        meta["latest"] = max(meta["latest"], fd.isoformat())
+    info["files"] = len(frames)
+    if not frames:
+        return pd.DataFrame(columns=ROW_COLS), info
+    rows = pd.concat(frames, ignore_index=True)
+    rows = rows.drop_duplicates(["folder", "date", "login"], keep="last")
+    info["rows"] = len(rows)
+    return rows, info
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_case_base(lookback_days):
+    """Absence rows (anything except P / OFF) become cases: one case per employee per day."""
+    rows, _ = load_roster(lookback_days)
+    if rows.empty:
+        return pd.DataFrame(columns=CASE_COLS)
+    d = rows[~rows["att"].isin(EXCLUDED_ATTENDANCE)].copy()
+    if d.empty:
+        return pd.DataFrame(columns=CASE_COLS)
+    key = d["empid"].where(d["empid"] != "", d["login"])
+    d["id"] = "WBC-" + d["date"].str.replace("-", "", regex=False) + "-" + key.map(_safe)
+    d = d.drop_duplicates("id", keep="last")
+    base = pd.DataFrame({"id": d["id"], "login": d["login"], "empid": d["empid"], "name": d["name"],
+                         "site": d["site"], "mgr": d["mgr"], "shift": d["shift"], "agency": d["agency"],
+                         "absent": d["att"], "created": d["date"], "status": "Open", "source": "dwd_s3",
+                         "sick_hint": (d["att"] == "SL").astype(int), "folder": d["folder"]})
+    for col in CASE_COLS:
+        if col not in base.columns:
+            base[col] = ""
+    return base[CASE_COLS]
+
+
+def load_cases(user=None):
+    """Cases from the daily files + whatever people have done to them (saved in storage). user=None -> no site filter."""
+    base = load_case_base(LOOKBACK_DAYS)
+    recs = load_state_records(f"{STATE_DIR}/cases/")
+    rows = {r["id"]: r for r in base.to_dict("records")}
+    for r in recs:
+        cid = r.get("id")
+        if not cid:
+            continue
+        if cid in rows:
+            rows[cid].update({k: r[k] for k in WORKFLOW_KEYS if k in r})
+        else:
+            rows[cid] = dict(r)                                   # older than the lookback window: kept from its saved copy
+    df = pd.DataFrame(list(rows.values())) if rows else pd.DataFrame(columns=CASE_COLS)
+    for col in CASE_COLS:
+        if col not in df.columns:
+            df[col] = ""
+    df = df.fillna("")
+    allowed = allowed_sites(user) if user else None
+    if allowed is not None:
+        df = df[df["site"].isin(allowed)]
+    df = df[~df["absent"].astype(str).str.strip().str.upper().isin(EXCLUDED_ATTENDANCE)]
+    # planned leave (PL) is not an absence: PL rows that are not closed never show up as cases
+    is_pl = df["absent"].astype(str).str.strip().str.upper() == "PL"
+    df = df[~(is_pl & (df["status"].astype(str).str.strip().str.lower() != "closed"))]
+    df = df.sort_values(["created", "id"], ascending=False)
+    return prepare(df)
+
+
+def get_case(case_id):
+    df = load_cases(None)
+    r = df[df["id"] == case_id]
+    return r.iloc[0].to_dict() if not r.empty else None
+
+
+def save_case_state(case):
+    rec = {k: _clean(case.get(k, "")) for k in CASE_COLS}
+    write_json(f"{STATE_DIR}/cases/{_safe(rec['id'])}.json", rec)
+    load_state_records.clear()
+
+
+def ua_offences_df():
+    cols = ["login", "name", "empid", "site", "date", "offence_type"]
+    recs = load_state_records(f"{STATE_DIR}/ua/")
+    df = pd.DataFrame(recs) if recs else pd.DataFrame(columns=cols)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df[cols].fillna("").sort_values("date", ascending=False).reset_index(drop=True)
+
+
+def upl_summary_df():
+    """UPL per employee, worked out from the daily files: scheduled days = every day except OFF;
+    UPL days = absence days (not P / OFF / PL) minus cases closed as Incorrect Entry / Converted to PL."""
+    cols = ["login", "site", "scheduled_days", "upl_days", "updated"]
+    rows, _ = load_roster(LOOKBACK_DAYS)
+    if rows.empty:
+        return pd.DataFrame(columns=cols)
+    sched = rows[rows["att"] != "OFF"]
+    absent = rows[~rows["att"].isin(EXCLUDED_ATTENDANCE | {"PL"})]
+    cases = load_cases(None)
+    rev = cases[cases["outcome"].isin(UPL_REVERSING)]["login"].value_counts()
+    g = sched.groupby("login").agg(site=("site", "last"), scheduled_days=("date", "count"), updated=("date", "max"))
+    g["upl_days"] = absent.groupby("login").size().reindex(g.index, fill_value=0)
+    g["upl_days"] = (g["upl_days"] - rev.reindex(g.index, fill_value=0)).clip(lower=0).astype(int)
+    g = g.reset_index()
+    return g[cols].sort_values("updated", ascending=False).reset_index(drop=True)
+
+
+# ----------------------------------------------------------------
+# USERS + CUSTOM SITES  (small JSON files in storage)
+# ----------------------------------------------------------------
+@st.cache_data(ttl=30, show_spinner=False)
+def load_users():
+    users = None
+    try:
+        users = read_json(f"{STATE_DIR}/users.json", None)
+    except Exception:
+        users = []                                        # storage hiccup: fall back to the built-in logins, don't overwrite
+    else:
+        if not isinstance(users, list):
+            users = [dict(u, added=str(datetime.date.today())) for u in DEFAULT_USERS]
             try:
-                file_path = excel_files[0]
-                xls = pd.ExcelFile(file_path)
-                sheet_name = 'Roster' if 'Roster' in xls.sheet_names else xls.sheet_names[0]
+                write_json(f"{STATE_DIR}/users.json", users)
+            except Exception:
+                pass
+    have = {str(u.get("alias", "")).lower() for u in users}
+    for d in DEFAULT_USERS:                               # the two built-in logins can never be locked out
+        if d["alias"] not in have:
+            users.append(dict(d, added=str(datetime.date.today())))
+    return users
 
-                df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=5)
-                df.columns = [str(c).strip() for c in df.columns]
 
-                for idx, row in df.iterrows():
-                    psoft_no = str(row.get('Psoft No', ''))
-                    amz_id = str(row.get('AMZ ID', f'AUTO-{idx}'))
-                    if amz_id == 'nan' or not amz_id:
-                        amz_id = f'AUTO-{idx}'
-
-                    name = str(row.get('EMP Name', ''))
-                    site = str(row.get('Building', 'AUH1'))
-                    if site.strip().lower() in ("nan", ""):
-                        site = ""
-                    mgr = str(row.get('Line Manager', ''))
-                    shift = str(row.get('Shift', ''))
-                    agency = str(row.get('3P', ''))
-                    attendance = str(row.get('Attendance ', row.get('Attendance', 'Open')))
-                    doj = str(row.get('DOJ', str(datetime.date.today())))
-                    if attendance.strip().upper() in EXCLUDED_ATTENDANCE:
-                        continue                                  # Present / OFF - no welcome back conversation needed
-
-                    case_id = f"CASE-{psoft_no if psoft_no and psoft_no != 'nan' else idx}"
-
-                    c.execute('''INSERT OR IGNORE INTO cases (
-                        id, login, empid, name, site, mgr, shift, agency, absent, created, status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                              (str(case_id), str(amz_id), str(psoft_no), str(name), str(site), str(mgr), str(shift), str(agency), str(attendance), str(doj)[:10], "Open"))
-
-                c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('excel_imported', ?)", (file_path,))
-                conn.commit()
-            except Exception as e:
-                print("Error loading excel sheet:", e)
-
-    conn.close()
+def save_users(users):
+    write_json(f"{STATE_DIR}/users.json", users)
+    load_users.clear()
 
 
 def get_user_by_credential(val):
     if not val:
         return None
-    val = val.strip()
-    db = get_db()
-    # tokens from the old portal are mixed-case, aliases are lower-case
-    row = db.execute('SELECT * FROM users WHERE token=? OR alias=?', (val, val.lower())).fetchone()
-    db.close()
-    return dict(row) if row else None
+    val = val.strip().lower()
+    for u in load_users():
+        if str(u.get("alias", "")).lower() == val:
+            return {"alias": u["alias"], "role": u.get("role", "VPOC"), "sites": u.get("sites") or "All",
+                    "added": u.get("added", "")}
+    return None
 
 
-def load_cases(user):
-    query_, params, conds = 'SELECT * FROM cases', [], []
-    allowed = allowed_sites(user)
-    if allowed is not None:
-        if not allowed:
-            conds.append("1=0")
-        else:
-            conds.append(f"site IN ({','.join('?' for _ in allowed)})")
-            params.extend(allowed)
-    if conds:
-        query_ += ' WHERE ' + ' AND '.join(conds)
-    query_ += ' ORDER BY created DESC, id DESC'
-    db = get_db()
-    rows = [dict(r) for r in db.execute(query_, params).fetchall()]
-    db.close()
-    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=CASE_COLS)
-    for col in CASE_COLS:
-        if col not in df.columns:
-            df[col] = ""
-    df = df.fillna("")
-    df = df[~df["absent"].astype(str).str.strip().str.upper().isin(EXCLUDED_ATTENDANCE)]
-    # planned leave (PL) is not an absence: PL rows that are not closed never show up as cases
-    is_pl = df["absent"].astype(str).str.strip().str.upper() == "PL"
-    df = df[~(is_pl & (df["status"].astype(str).str.strip().str.lower() != "closed"))]
-    return prepare(df)
+@st.cache_data(ttl=60, show_spinner=False)
+def load_custom_sites():
+    try:
+        data = read_json(f"{STATE_DIR}/custom_sites.json", [])
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
 
 
-def query(sql, params=()):
-    db = get_db()
-    rows = [dict(r) for r in db.execute(sql, params).fetchall()]
-    db.close()
-    return rows
-
-
-def execute(sql, params=()):
-    db = get_db()
-    db.execute(sql, params)
-    db.commit()
-    db.close()
-
-
-def read_table(sql):
-    db = get_db()
-    rows = [dict(r) for r in db.execute(sql).fetchall()]
-    db.close()
-    return pd.DataFrame(rows)
+def save_custom_sites(items):
+    write_json(f"{STATE_DIR}/custom_sites.json", items)
+    load_custom_sites.clear()
 
 
 # ----------------------------------------------------------------
@@ -577,13 +898,12 @@ def read_table(sql):
 # ----------------------------------------------------------------
 def get_site_map():
     merged = copy.deepcopy(SITE_MAP_DEFAULT)
-    try:
-        for r in query("SELECT country, bu, site FROM custom_sites WHERE active=1"):
-            merged.setdefault(r["country"], {}).setdefault(r["bu"], [])
-            if r["site"] not in merged[r["country"]][r["bu"]]:
-                merged[r["country"]][r["bu"]].append(r["site"])
-    except Exception:
-        pass
+    for r in load_custom_sites():
+        if not r.get("active", 1):
+            continue
+        merged.setdefault(r["country"], {}).setdefault(r["bu"], [])
+        if r["site"] not in merged[r["country"]][r["bu"]]:
+            merged[r["country"]][r["bu"]].append(r["site"])
     return merged
 
 
@@ -597,12 +917,29 @@ def _valid_or_reset(key, options):
         del st.session_state[key]
 
 
+def folder_groups(df, allowed):
+    """storage folder -> its sites: the configured SITE_FOLDERS plus every site actually found in that folder's files."""
+    groups = {f: list(ss) for f, ss in SITE_FOLDERS.items()}
+    if not df.empty and "folder" in df.columns:
+        for f, ss in df[df["folder"] != ""].groupby("folder")["site"]:
+            lst = groups.setdefault(f, [])
+            for s in ss.unique():
+                if s and s not in lst:
+                    lst.append(s)
+    if allowed is not None:
+        groups = {f: [s for s in ss if s in allowed] for f, ss in groups.items()}
+    return {f: sorted(ss) for f, ss in groups.items() if ss}
+
+
 def site_filters(df, key, cols):
-    """Country -> BU -> Site selector (from the old portal). Returns the filtered cases."""
+    """Country -> BU -> Site selector.
+    The main site of each storage folder (AUH1, DXB5, DXB3 ...) selects ALL the sub-sites that live in the same
+    files - e.g. choosing "AUH1" shows AUH1 + AUH3 + DAD1. Every site can still be chosen on its own."""
     smap = get_site_map()
     meta = site_meta(smap)
     allowed = allowed_sites(current())
     counts = df["site"].value_counts().to_dict() if not df.empty else {}
+    groups = folder_groups(df, allowed)
 
     country_opts = ["All"] + list(smap.keys())
     _valid_or_reset(f"{key}_country", country_opts)
@@ -615,20 +952,39 @@ def site_filters(df, key, cols):
     bu = cols[1].selectbox("BU", bu_opts, key=f"{key}_bu", label_visibility="collapsed",
                            format_func=lambda b: "All BUs" if b == "All" else b)
 
+    narrowed = country != "All" or bu != "All"
     pool = [s for s, (c, b) in meta.items() if country in ("All", c) and bu in ("All", b)]
-    if country == "All" and bu == "All":
+    if not narrowed:
         pool += [s for s in counts if s and s not in meta]          # sites found in data but not in the map
+        pool += [s for ss in groups.values() for s in ss if s not in meta]
     if allowed is not None:
         pool = [s for s in pool if s in allowed]
     pool = sorted(set(pool))
-    site_opts = ["All"] + pool
+    visible = {f: ss for f, ss in groups.items() if len(ss) > 1 and any(s in pool for s in ss)}
+    site_opts = ["All"] + [f"@{f}" for f in sorted(visible)] + pool
     _valid_or_reset(f"{key}_site", site_opts)
-    site = cols[2].selectbox("Site", site_opts, key=f"{key}_site", label_visibility="collapsed",
-                             format_func=lambda s: "All Sites" if s == "All" else f"{s} ({counts.get(s, 0)})")
 
+    def fmt_site(s):
+        if s == "All":
+            return "All Sites"
+        if s.startswith("@"):
+            f = s[1:]
+            subs = [x for x in visible[f] if x != f]
+            n = int(df["site"].isin(visible[f]).sum()) if not df.empty else 0
+            return f"{f} + sub-sites: {', '.join(subs)} ({n})"
+        if s in visible:                                          # a main site is also listed on its own
+            return f"{s} only ({counts.get(s, 0)})"
+        return f"{s} ({counts.get(s, 0)})"
+
+    site = cols[2].selectbox("Site", site_opts, key=f"{key}_site", label_visibility="collapsed", format_func=fmt_site)
+
+    if site.startswith("@"):
+        f = site[1:]
+        out = df[(df["folder"] == f) | df["site"].isin(groups.get(f, []))]
+        return out[out["site"].isin(pool)] if narrowed else out
     if site != "All":
         return df[df["site"] == site]
-    if country != "All" or bu != "All":
+    if narrowed:
         return df[df["site"].isin(pool)]
     return df
 
@@ -769,139 +1125,6 @@ def mountain_html(df):
 
 
 # ----------------------------------------------------------------
-# OLD-DATABASE IMPORT  (merge / replace from a wbc.db of the old portal)
-# ----------------------------------------------------------------
-# table -> (primary key column or None, de-dupe condition used when merging)
-IMPORT_TABLES = {
-    "cases": ("id", None),
-    "upl_summary": ("login", None),
-    "ua_offences": (None, "m.login=o.login AND m.date=o.date AND IFNULL(m.offence_type,'')=IFNULL(o.offence_type,'')"),
-    "custom_sites": (None, "m.country=o.country AND m.bu=o.bu AND m.site=o.site"),
-}
-
-
-def import_old_db(raw, replace=False, drop_roster_placeholders=False):
-    if not raw.startswith(b"SQLite format 3"):
-        return False, "That file is not a SQLite database (expected the old wbc.db)."
-    init_db()
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup = f"{DB_PATH}.bak_{stamp}"
-    shutil.copy2(DB_PATH, backup)
-    tmp = os.path.join(tempfile.gettempdir(), f"wbc_import_{stamp}.db")
-    with open(tmp, "wb") as fh:
-        fh.write(raw)
-    conn = sqlite3.connect(DB_PATH)
-    report = []
-    try:
-        conn.execute("ATTACH DATABASE ? AS old", (tmp,))
-        for table, (key, dedupe) in IMPORT_TABLES.items():
-            if not conn.execute("SELECT 1 FROM old.sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
-                continue
-            new_cols = [r[1] for r in conn.execute(f"PRAGMA main.table_info({table})")]
-            old_cols = {r[1] for r in conn.execute(f"PRAGMA old.table_info({table})")}
-            cols = [c for c in new_cols if c in old_cols and not (key is None and c == "id")]
-            if not cols:
-                continue
-            col_sql = ",".join(f'"{c}"' for c in cols)
-            sel_sql = ",".join(f'o."{c}"' for c in cols)
-            if replace:
-                conn.execute(f"DELETE FROM main.{table}")
-            if key:                                              # same key -> old (accurate) row wins
-                cur = conn.execute(f"INSERT OR REPLACE INTO main.{table} ({col_sql}) SELECT {sel_sql} FROM old.{table} o")
-            elif dedupe:
-                cur = conn.execute(f"INSERT INTO main.{table} ({col_sql}) SELECT {sel_sql} FROM old.{table} o "
-                                   f"WHERE NOT EXISTS (SELECT 1 FROM main.{table} m WHERE {dedupe})")
-            else:
-                cur = conn.execute(f"INSERT OR IGNORE INTO main.{table} ({col_sql}) SELECT {sel_sql} FROM old.{table} o")
-            report.append(f"{table}: {cur.rowcount}")
-        removed = 0
-        if drop_roster_placeholders and not replace:
-            cur = conn.execute("DELETE FROM main.cases WHERE id LIKE 'CASE-%' AND status IN ('Open','In Progress') "
-                               "AND id NOT IN (SELECT id FROM old.cases)")
-            removed = cur.rowcount
-        conn.execute("INSERT OR REPLACE INTO main.settings (key, value) VALUES ('excel_imported', 'old-db-import')")
-        conn.commit()
-        conn.execute("DETACH DATABASE old")
-    except Exception as e:
-        conn.rollback()
-        return False, f"Import failed, nothing changed: {e}  (backup: {backup})"
-    finally:
-        conn.close()
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-    msg = "Imported - " + ", ".join(report) if report else "Imported - no matching tables found in that file."
-    if removed:
-        msg += f", removed {removed} untouched roster placeholder cases"
-    return True, msg + f".  Backup of the previous database: {os.path.basename(backup)}"
-
-
-# ----------------------------------------------------------------
-# DWD SYNC  (ported from the old /api/sync/dwd)
-# ----------------------------------------------------------------
-def yesterday_ast():
-    ast = datetime.timezone(datetime.timedelta(hours=4))
-    return (datetime.datetime.now(ast) - datetime.timedelta(days=1)).date()
-
-
-def run_dwd_sync(csv_text, date_str, sites):
-    done_key = f"dwd_sync_{date_str}"
-    if query("SELECT 1 FROM settings WHERE key=?", (done_key,)):
-        return False, f"{date_str} has already been synced - running it twice would double-count UPL days."
-    raw_rows = list(csv.DictReader(io.StringIO(csv_text)))
-    rows = [{(k or "").strip().lower(): (v or "").strip() for k, v in r.items()} for r in raw_rows]
-    if not rows:
-        return False, "The CSV is empty."
-    if "login" not in rows[0] or "absent" not in rows[0]:
-        return False, "The CSV needs at least the columns: login, absent (also site, empid, name, agency, shift, mgr)."
-
-    absent = []
-    for r in rows:
-        if r.get("absent", "") != "1":
-            continue
-        site = r.get("site", "")
-        if sites and site not in sites:
-            continue
-        absent.append({"login": r.get("login", "").lower(), "empid": r.get("empid", ""), "name": r.get("name", ""),
-                       "site": site, "agency": r.get("agency", "") or "Amazon", "shift": r.get("shift", ""),
-                       "mgr": r.get("mgr", ""), "date": date_str})
-
-    db = get_db()
-    created = skipped = 0
-    try:
-        for emp in absent:
-            short = hashlib.md5((emp["login"] + "|" + emp["date"]).encode()).hexdigest()[:8].upper()
-            if db.execute("SELECT id FROM cases WHERE login=? AND absent=?", (emp["login"], emp["date"])).fetchone():
-                skipped += 1
-                continue
-            db.execute("INSERT OR IGNORE INTO cases (id,login,empid,name,site,agency,shift,mgr,absent,created,source) "
-                       "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                       ("WBC-AUTO-" + short, emp["login"], emp["empid"], emp["name"], emp["site"], emp["agency"],
-                        emp["shift"], emp["mgr"], emp["date"], emp["date"], "dwd_sync"))
-            created += 1
-        for r in rows:                                           # UPL summary: +1 scheduled day per row (as before)
-            lg = r.get("login", "").lower()
-            if not lg:
-                continue
-            is_abs = 1 if r.get("absent", "") == "1" else 0
-            if db.execute("SELECT 1 FROM upl_summary WHERE login=?", (lg,)).fetchone():
-                db.execute("UPDATE upl_summary SET scheduled_days=scheduled_days+1, upl_days=upl_days+?, updated=? WHERE login=?",
-                           (is_abs, date_str, lg))
-            else:
-                db.execute("INSERT INTO upl_summary (login,site,scheduled_days,upl_days,updated) VALUES (?,?,1,?,?)",
-                           (lg, r.get("site", ""), is_abs, date_str))
-        db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (done_key, datetime.datetime.now().isoformat()))
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        return False, f"Sync failed, nothing saved: {e}"
-    finally:
-        db.close()
-    return True, f"{date_str}: {created} new cases created, {skipped} already existed ({len(absent)} absent in selected sites)."
-
-
-# ----------------------------------------------------------------
 # UI BUILDING BLOCKS
 # ----------------------------------------------------------------
 def current():
@@ -943,9 +1166,13 @@ def ua_status(dates, today=None):
     return {"count": len(recent), "level": level, "valid_until": valid}
 
 
+def ua_records(login=None):
+    recs = load_state_records(f"{STATE_DIR}/ua/")
+    return [r for r in recs if login is None or r.get("login") == login]
+
+
 def ua_for(login):
-    rows = query("SELECT date FROM ua_offences WHERE login=? ORDER BY date", (login,))
-    return ua_status([r["date"] for r in rows])
+    return ua_status([r.get("date") for r in ua_records(login)])
 
 
 def next_escalation(login):
@@ -956,34 +1183,20 @@ def next_escalation(login):
 
 def save_upload(case_id, up):
     safe = up.name.replace("/", "_").replace("\\", "_")
-    if S3_BUCKET:
-        import boto3
-        boto3.client("s3").upload_fileobj(io.BytesIO(up.getvalue()), S3_BUCKET, f"{S3_PREFIX}/{case_id}/{safe}",
-                                          ExtraArgs={"ContentType": up.type or "application/octet-stream"})
-    else:
-        folder = os.path.join(UPLOAD_DIR, case_id)
-        os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, safe), "wb") as fh:
-            fh.write(up.getvalue())
+    s3_write(f"{UPLOAD_DIR}/{case_id}/{safe}", up.getvalue(), up.type or "application/octet-stream")
     return safe
 
 
 def show_existing_doc(case_id, filename, tag="a"):
     if not filename:
         return
-    if S3_BUCKET:
-        try:
-            import boto3
-            url = boto3.client("s3").generate_presigned_url(
-                "get_object", Params={"Bucket": S3_BUCKET, "Key": f"{S3_PREFIX}/{case_id}/{filename}"}, ExpiresIn=300)
-            st.link_button(f"📎 {filename}", url)
-            return
-        except Exception:
-            pass
-    path = os.path.join(UPLOAD_DIR, case_id, filename)
-    if os.path.exists(path):
-        with open(path, "rb") as fh:
-            st.download_button(f"📎 {filename}", fh.read(), filename, key=f"dl_{tag}_{case_id}")
+    data = None
+    try:
+        data = s3_read(f"{UPLOAD_DIR}/{case_id}/{filename}")
+    except Exception:
+        pass
+    if data:
+        st.download_button(f"📎 {filename}", data, filename, key=f"dl_{tag}_{case_id}")
     else:
         st.caption(f"Current document: {filename}")
 
@@ -1014,31 +1227,32 @@ def close_case(case, user, label, remarks, doc_type, up, override):
         doc_type = ""
     elif outcome == "Sick Leave" and doc_file and not doc_type:
         doc_type = "Medical Certificate"
-    execute("""UPDATE cases SET status='Closed', outcome=?, reason=?, doc_type=?, doc_file=?, closed=?,
-               closed_by=?, closedby=?, escalation_level=?, escalation_action=?,
-               ua_escalation_level=?, escalation_valid_until=? WHERE id=?""",
-            (outcome, remarks, doc_type, doc_file, today, user["alias"], user["alias"], esc_level, esc_action,
-             int(esc_level or 0), valid_until, case["id"]))
-    prev = case.get("outcome") or ""
-    if prev not in UPL_REVERSING and outcome in UPL_REVERSING:
-        execute("UPDATE upl_summary SET upl_days=MAX(0,upl_days-1) WHERE login=?", (case["login"],))
-    elif prev in UPL_REVERSING and outcome not in UPL_REVERSING:
-        execute("UPDATE upl_summary SET upl_days=upl_days+1 WHERE login=?", (case["login"],))
-    msg = f"{clean_id(case['id'])} closed: {outcome}."
+
+    rec = {k: case.get(k, "") for k in CASE_COLS}
+    rec.update({"status": "Closed", "outcome": outcome, "reason": remarks, "doc_type": doc_type,
+                "doc_file": doc_file, "closed": today, "closed_by": user["alias"], "closedby": user["alias"],
+                "escalation_level": esc_level, "escalation_action": esc_action,
+                "ua_escalation_level": int(esc_level or 0), "escalation_valid_until": valid_until})
+    try:
+        save_case_state(rec)
+    except Exception as e:
+        return False, f"Could not save to Canopy storage: {e}"
+
+    msg = f"{case['id']} closed: {outcome}."
     if outcome == "Unauthorized":
-        if not query("SELECT 1 FROM ua_offences WHERE login=? AND date=?", (case["login"], today)):
-            try:
-                execute("INSERT INTO ua_offences (login,name,empid,site,date) VALUES (?,?,?,?,?)",
-                        (case["login"], case.get("name", ""), case.get("empid", ""), case.get("site", ""), today))
-            except Exception:
-                execute("INSERT INTO ua_offences (login,site,date) VALUES (?,?,?)",
-                        (case["login"], case.get("site", ""), today))
+        try:                                    # one offence per associate per day - saving again just overwrites it
+            write_json(f"{STATE_DIR}/ua/{_safe(case['login'])}__{today}.json",
+                       {"login": case["login"], "name": case.get("name", ""), "empid": case.get("empid", ""),
+                        "site": case.get("site", ""), "date": today, "offence_type": ""})
+            load_state_records.clear()
+        except Exception as e:
+            return False, f"Case closed, but the UA offence could not be saved: {e}"
         msg += f" Escalation: L{esc_level} - {esc_action}. Valid until {ua_for(case['login'])['valid_until']}."
     return True, msg
 
 
 def _case_date(row):
-    for k in ("absent", "closed", "created"):
+    for k in ("created", "absent", "closed"):
         d = pd.to_datetime(row.get(k), errors="coerce")
         if pd.notna(d):
             return d.date()
@@ -1048,11 +1262,12 @@ def _case_date(row):
 def build_verbatim(c):
     login, name = c["login"], c.get("name") or c["login"]
     today = datetime.date.today()
-    hist = query("SELECT date, offence_type FROM ua_offences WHERE login=? ORDER BY date", (login,))
+    hist = [{"date": r.get("date"), "offence_type": r.get("offence_type")}
+            for r in sorted(ua_records(login), key=lambda r: str(r.get("date")))]
     ua = ua_for(login)
     lvl, action, _ = next_escalation(login)
-    ua_cases = query("SELECT absent, closed, created, escalation_action FROM cases "
-                     "WHERE login=? AND outcome='Unauthorized'", (login,))
+    all_cases = load_cases(None)
+    ua_cases = all_cases[(all_cases["login"] == login) & (all_cases["outcome"] == "Unauthorized")].to_dict("records")
     timeline = [(h["date"], h.get("offence_type") or "Unauthorized") for h in hist]
     seen = {t[0] for t in timeline}
     case_dates = []
@@ -1073,7 +1288,7 @@ def build_verbatim(c):
     recent6 = [d for d in case_dates if d >= cut]
     older6 = [d for d in case_dates if d < cut]
     cur_lvl = f"L{ua['level']} ({UAL[ua['level']]})" if ua["level"] else "None (First Offence)"
-    absent = c.get("absent") or "today"
+    absent = c.get("created") or "today"
     line = "━" * 37
     v = f"📋 WBC COACHING VERBATIM\n{line}\n\n👤 ASSOCIATE PROFILE\n"
     v += f"Name: {name} | Login: {login} | Site: {c.get('site') or '-'}\n"
@@ -1124,23 +1339,27 @@ def build_verbatim(c):
 
 def open_case(case_id):
     """Same as the old 'click a case': mark it In Progress, then open the work window."""
-    rows = query("SELECT status FROM cases WHERE id=?", (case_id,))
-    if rows and rows[0]["status"] == "Open":
-        execute("UPDATE cases SET status='In Progress' WHERE id=?", (case_id,))
+    c = get_case(case_id)
+    if c and c.get("status") == "Open":
+        c["status"] = "In Progress"
+        try:
+            save_case_state(c)
+        except Exception as e:
+            st.toast(f"Could not mark the case In Progress: {e}", icon="⚠️")
     case_dialog(case_id)
 
 
 @st.dialog("Case details", width="large")
 def case_dialog(case_id):
-    rows = query("SELECT * FROM cases WHERE id=?", (case_id,))
-    if not rows:
+    c = get_case(case_id)
+    if not c:
         st.error("Case not found.")
         return
-    c, user = rows[0], current()
+    user = current()
     ua = ua_for(c["login"])
-    info = [("Case ID", clean_id(c["id"])), ("Login", c["login"]), ("Employee ID", clean_id(c["empid"])),
+    info = [("Case ID", c["id"]), ("Login", c["login"]), ("Employee ID", clean_id(c["empid"])),
             ("Name", c["name"]), ("Site", c["site"]), ("Manager", c["mgr"]), ("Shift", c["shift"]),
-            ("Agency", c["agency"]), ("Attendance / absent", c["absent"]),
+            ("Agency", c["agency"]), ("Attendance code", c["absent"]), ("Absence date", c["created"]),
             ("Current UA", f"L{ua['level']} — {UAL[ua['level']]}" if ua["count"] else "None")]
     # two columns of label/value pairs, so the form below fits on screen without scrolling
     st.markdown('<div class="kv kv2">' + "".join(f"<b>{esc(k)}</b><span>{esc(v) or '–'}</span>" for k, v in info) + "</div>",
@@ -1379,9 +1598,9 @@ def page_cases():
                                    key="dl_xlsx_cases", use_container_width=True)
 
 
-def table_page(title, sub, icon, card_title, card_sub, sql, chips, empty_msg, key):
+def table_page(title, sub, icon, card_title, card_sub, loader, chips, empty_msg, key):
     page_shell(title, sub)
-    data = read_table(sql)
+    data = loader()
     items = chips(data)
     if items:
         st.markdown(chips_html(items), unsafe_allow_html=True)
@@ -1411,14 +1630,14 @@ def upl_chips(d):
 
 def page_ua():
     table_page("UA Offences Tracker", "Comprehensive overview of recorded unauthorized absence offences.", "list",
-               "UA Offences", "Most recent offences first", "SELECT * FROM ua_offences ORDER BY date DESC",
-               ua_chips, "No UA offences recorded in the database.", "ua")
+               "UA Offences", "Most recent offences first", ua_offences_df,
+               ua_chips, "No UA offences recorded yet.", "ua")
 
 
 def page_upl():
     table_page("UPL Summary Analytics", "Unplanned leave and schedule performance summary.", "list",
-               "UPL Summary", "Unplanned leave per employee", "SELECT * FROM upl_summary ORDER BY updated DESC",
-               upl_chips, "No UPL summary data available.", "upl")
+               "UPL Summary", f"Unplanned leave per employee, from the daily files of the last {LOOKBACK_DAYS} days",
+               upl_summary_df, upl_chips, "No UPL summary data available.", "upl")
 
 
 DISC_COLS = ["closed", "id", "login", "name", "empid", "site", "mgr", "agency", "absent", "outcome",
@@ -1456,8 +1675,7 @@ def page_disciplinary():
             view = view[view["outcome"] == pick]
         out = view[DISC_COLS].sort_values("closed", ascending=False).rename(columns=DISC_LABELS)
         if out.empty:
-            st.info("No closed cases yet. When a case is closed as Authorized or Unauthorized it appears here "
-                    "(for old cases, import the old wbc.db in Settings).")
+            st.info("No closed cases yet. When a case is closed as Authorized or Unauthorized it appears here.")
         else:
             st.dataframe(out, use_container_width=True, height=440, hide_index=True)
             d1, d2, _ = st.columns([1, 1, 4])
@@ -1468,26 +1686,6 @@ def page_disciplinary():
                 d2.download_button("⬇ Export Excel", xl, "disciplinary_actions.xlsx",
                                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                    key="dl_xlsx_disc", use_container_width=True)
-
-
-def page_sync():
-    user = current()
-    page_shell("DWD Sync", "Create absence cases from the daily DWD CSV (same logic as the old portal).")
-    if not is_all_access(user):
-        st.error("Access Denied: only Admin / VPOC / PXT can run the DWD sync.")
-        return
-    with st.container(border=True, key="card_sync"):
-        st.markdown(card_header_html("list", "Upload DWD CSV",
-                                     "Columns: login, empid, name, site, agency, shift, mgr, absent (1 = absent)"),
-                    unsafe_allow_html=True)
-        c1, c2 = st.columns([1, 2])
-        d = c1.date_input("Absence date", value=yesterday_ast(), key="sync_date")
-        pool = sorted(set(TARGET_SITES) | set(site_meta(get_site_map())))
-        sites = c2.multiselect("Sites to include", pool, default=TARGET_SITES, key="sync_sites")
-        up = st.file_uploader("DWD CSV", type=["csv"], key="sync_csv")
-        if st.button("Run sync", type="primary", disabled=up is None, key="sync_run"):
-            ok, msg = run_dwd_sync(up.getvalue().decode("utf-8-sig", errors="replace"), str(d), sites)
-            (st.success if ok else st.error)(msg)
 
 
 ACCESS_ROLES = ["VPOC", "HRBP"]               # the only two roles that can be given
@@ -1501,15 +1699,22 @@ def _add_access():
     alias = str(st.session_state.get("acc_alias", "")).strip().lower()
     role = st.session_state.get("acc_role", ACCESS_ROLES[0])
     sites = st.session_state.get("acc_sites", []) or []
+    users = list(load_users())
     if not re.fullmatch(r"[a-z0-9._-]+", alias):
         st.session_state["_acc_msg"] = (False, "Enter a valid alias (letters, numbers, dot, dash or underscore - no spaces).")
     elif role not in ACCESS_ROLES:
         st.session_state["_acc_msg"] = (False, "Role must be VPOC or HRBP.")
-    elif query("SELECT 1 FROM users WHERE alias=?", (alias,)):
+    elif any(str(u.get("alias", "")).lower() == alias for u in users):
         st.session_state["_acc_msg"] = (False, f"{alias} already has access.")
     else:
-        execute("INSERT INTO users (alias, role, sites, added, token) VALUES (?,?,?,?,?)",
-                (alias, role, ",".join(sites) if (sites and role == "HRBP") else "All", str(datetime.date.today()), alias))
+        users.append({"alias": alias, "role": role,
+                      "sites": ",".join(sites) if (sites and role == "HRBP") else "All",
+                      "added": str(datetime.date.today())})
+        try:
+            save_users(users)
+        except Exception as e:
+            st.session_state["_acc_msg"] = (False, f"Could not save to Canopy storage: {e}")
+            return
         st.session_state["_acc_msg"] = (True, f"{alias} can now open the portal as {role}.")
         st.session_state["acc_alias"] = ""
         st.session_state["acc_sites"] = []
@@ -1528,25 +1733,29 @@ def page_users():
         a, b, c, d = st.columns([1.2, 0.8, 1.6, 0.8], vertical_alignment="bottom")
         a.text_input("User alias", placeholder="e.g. mnnafee", key="acc_alias")
         b.selectbox("Role", ACCESS_ROLES, key="acc_role")
-        c.multiselect("Sites - HRBP only (empty = all sites; VPOC always sees all)", sorted(site_meta(get_site_map())), key="acc_sites")
+        site_choices = sorted(set(site_meta(get_site_map())) | {s for ss in SITE_FOLDERS.values() for s in ss})
+        c.multiselect("Sites - HRBP only (empty = all sites; VPOC always sees all)", site_choices, key="acc_sites")
         d.button("Add access", type="primary", key="acc_add", on_click=_add_access, use_container_width=True)
         msg = st.session_state.pop("_acc_msg", None)
         if msg:
             (st.success if msg[0] else st.error)(msg[1])
 
-    people = query("SELECT alias, role, sites, added FROM users ORDER BY added DESC, alias")
+    people = sorted(load_users(), key=lambda p: (str(p.get("added", "")), str(p.get("alias", ""))), reverse=True)
     with st.container(border=True, key="card_users"):
         st.markdown(card_header_html("list", "People with access", f"{len(people)} logins can open the portal"),
                     unsafe_allow_html=True)
         for p in people:
             x, y = st.columns([5, 1], vertical_alignment="center")
-            x.markdown(f'<div class="td"><b>{esc(p["alias"])}</b> · {esc(p["role"])} · '
-                       f'{esc(p["sites"] or "All")} · added {esc(p["added"])}</div>', unsafe_allow_html=True)
-            locked = (p["alias"] == user["alias"] or str(p["role"]).lower() == "admin"
-                      or p["alias"] in USER_MGMT_BYPASS)
+            x.markdown(f'<div class="td"><b>{esc(p["alias"])}</b> · {esc(p.get("role", ""))} · '
+                       f'{esc(p.get("sites") or "All")} · added {esc(p.get("added", ""))}</div>', unsafe_allow_html=True)
+            locked = (p["alias"] == user["alias"] or str(p.get("role", "")).lower() == "admin"
+                      or p["alias"] in USER_MGMT_BYPASS or p["alias"] in {d["alias"] for d in DEFAULT_USERS})
             if not locked and y.button("Remove", key=f"rm_user_{p['alias']}"):
-                execute("DELETE FROM users WHERE alias=?", (p["alias"],))
-                st.session_state["_flash"] = f"{p['alias']} no longer has access."
+                try:
+                    save_users([u for u in load_users() if u.get("alias") != p["alias"]])
+                    st.session_state["_flash"] = f"{p['alias']} no longer has access."
+                except Exception as e:
+                    st.error(f"Could not save to Canopy storage: {e}")
                 st.rerun()
 
     with st.container(border=True, key="card_sitesadmin"):
@@ -1558,18 +1767,28 @@ def page_users():
         bu = b.selectbox("BU", ["FC/SC", "AMZL"], key="ns_bu")
         site = c.text_input("Site code", placeholder="e.g. DXB9", key="ns_site").strip().upper()
         if d.button("Add site", key="ns_add", disabled=not site):
-            execute("INSERT OR IGNORE INTO custom_sites (country,bu,site,active,added_by,added_at) VALUES (?,?,?,1,?,?)",
-                    (country, bu, site, user["alias"], str(datetime.date.today())))
-            execute("UPDATE custom_sites SET active=1 WHERE country=? AND bu=? AND site=?", (country, bu, site))
-            st.session_state["_flash"] = f"{site} added."
+            items = [r for r in load_custom_sites() if not (r["country"] == country and r["bu"] == bu and r["site"] == site)]
+            items.append({"country": country, "bu": bu, "site": site, "active": 1,
+                          "added_by": user["alias"], "added_at": str(datetime.date.today())})
+            try:
+                save_custom_sites(items)
+                st.session_state["_flash"] = f"{site} added."
+            except Exception as e:
+                st.error(f"Could not save to Canopy storage: {e}")
             st.rerun()
-        custom = query("SELECT id, country, bu, site FROM custom_sites WHERE active=1 ORDER BY country, bu, site")
-        for r in custom:
+        custom = sorted([r for r in load_custom_sites() if r.get("active", 1)],
+                        key=lambda r: (r["country"], r["bu"], r["site"]))
+        for i, r in enumerate(custom):
             x, y = st.columns([5, 1], vertical_alignment="center")
             x.markdown(f'<div class="td">{COUNTRY_FLAGS.get(r["country"], "")} {esc(r["country"])} · {esc(r["bu"])} · <b>{esc(r["site"])}</b></div>',
                        unsafe_allow_html=True)
-            if y.button("Remove", key=f"rm_site_{r['id']}"):
-                execute("UPDATE custom_sites SET active=0 WHERE id=?", (r["id"],))
+            if y.button("Remove", key=f"rm_site_{i}"):
+                items = [q for q in load_custom_sites()
+                         if not (q["country"] == r["country"] and q["bu"] == r["bu"] and q["site"] == r["site"])]
+                try:
+                    save_custom_sites(items)
+                except Exception as e:
+                    st.error(f"Could not save to Canopy storage: {e}")
                 st.rerun()
         if not custom:
             st.caption("No custom sites yet - the built-in site list (UAE, Egypt, KSA, Turkiye) is always available.")
@@ -1577,68 +1796,42 @@ def page_users():
 
 def page_settings():
     user = current()
-    page_shell("Settings", "Portal configuration, environment status, and system settings.")
-    db_path = os.path.abspath(DB_PATH)
-    exists = os.path.exists(db_path)
-    size_kb = os.path.getsize(db_path) / 1024 if exists else 0
-    modified = (datetime.datetime.fromtimestamp(os.path.getmtime(db_path)).strftime("%b %d, %Y %I:%M %p") if exists else "–")
-    counts = {t: query(f"SELECT COUNT(*) n FROM {t}")[0]["n"] for t in ("cases", "ua_offences", "upl_summary", "users")}
-    excel = [f for f in os.listdir(".") if f.lower().endswith((".xlsx", ".xls"))]
-    src = query("SELECT value FROM settings WHERE key='excel_imported'")
-    if src and src[0]["value"] == "old-db-import":
-        src_label = "Old portal database (imported)"
-    elif src:
-        src_label = f"Excel file: {src[0]['value']} (sheet 'Roster', one case per employee)"
-    elif excel:
-        src_label = f"Excel file in app folder: {excel[0]} (sheet 'Roster')"
-    else:
-        src_label = "No Excel file found - cases come from DWD Sync / manual entry"
-    docs = f"S3 bucket: {S3_BUCKET}/{S3_PREFIX}" if S3_BUCKET else os.path.abspath(UPLOAD_DIR)
+    page_shell("Settings", "Portal configuration, Canopy storage connection and system status.")
+    s = s3_status()
+    rows, info = load_roster(LOOKBACK_DAYS)
+    cases = load_cases(None)
+    n_state = len(load_state_records(f"{STATE_DIR}/cases/"))
+    n_ua = len(load_state_records(f"{STATE_DIR}/ua/"))
+    n_users = len(load_users())
+    latest = max((m["latest"] for m in info["folders"].values() if m["latest"]), default="–")
+
     with st.container(border=True, key="card_settings"):
-        st.markdown(card_header_html("target", "System Status", "Environment and database"), unsafe_allow_html=True)
+        st.markdown(card_header_html("target", "Canopy Storage", "Where this portal reads and saves everything"),
+                    unsafe_allow_html=True)
         st.markdown(
-            f'<div class="kv"><b>Database file</b><span>{esc(db_path)}</span>'
-            f'<b>DB size / modified</b><span>{size_kb:,.0f} KB / {esc(modified)}</span>'
-            f'<b>Records</b><span>{counts["cases"]} cases · {counts["ua_offences"]} UA offences · '
-            f'{counts["upl_summary"]} UPL rows · {counts["users"]} users</span>'
-            f'<b>Cases loaded from</b><span>{esc(src_label)}</span>'
-            f'<b>Documents saved in</b><span>{esc(docs)}</span>'
+            f'<div class="kv"><b>Connection</b><span>{"✅ Connected" if s["connected"] else "❌ Not connected"} - {esc(s["message"])}</span>'
+            f'<b>Bucket</b><span>{esc(s["bucket"])}</span>'
+            f'<b>Folder (prefix)</b><span>{esc(s["prefix"])}</span>'
+            f'<b>Daily files read</b><span>{info["files"]} files · {info["rows"]:,} employee-days · '
+            f'last {LOOKBACK_DAYS} days · newest file {esc(latest)}</span>'
+            f'<b>Cases</b><span>{len(cases)} cases ({n_state} worked on / closed and saved) · {n_ua} UA offences · {n_users} users</span>'
+            f'<b>Saved to</b><span>{esc(STATE_DIR)}/ (cases, UA offences, users, sites) and {esc(UPLOAD_DIR)}/ (documents)</span>'
             f'<b>Signed in as</b><span>{esc(user["alias"])} ({esc(user["role"])})</span>'
             f'<b>Sites</b><span>{esc(user["sites"])}</span></div>', unsafe_allow_html=True)
-        st.warning("Cases are stored in a local SQLite file. On Streamlit Cloud this file is temporary and can be "
-                   "reset on reboot or redeploy, so download a backup regularly.")
-        if is_admin(user) and exists:
-            with open(db_path, "rb") as fh:
-                st.download_button("⬇ Download database backup (wbc.db)", fh.read(), "wbc.db",
-                                   "application/octet-stream", key="dl_db")
+        st.caption("Data refreshes automatically every few minutes; use 'Reload data' in the sidebar to pull new files right away.")
 
-    if is_admin(user):
-        with st.container(border=True, key="card_clean"):
-            st.markdown(card_header_html("check", "Remove P / OFF cases",
-                                         "Present and weekly-off rows never show in the app; this deletes them from the database"),
-                        unsafe_allow_html=True)
-            n_pf = query("SELECT COUNT(*) n FROM cases WHERE UPPER(TRIM(absent)) IN ('P','OFF') AND status != 'Closed'")[0]["n"]
-            st.write(f"{n_pf} unclosed cases with attendance P or OFF are stored in the database.")
-            sure = st.checkbox("Yes, delete them permanently", key="clean_sure", disabled=n_pf == 0)
-            if st.button("Delete P / OFF cases", disabled=not sure, key="clean_run"):
-                execute("DELETE FROM cases WHERE UPPER(TRIM(absent)) IN ('P','OFF') AND status != 'Closed'")
-                st.session_state["_flash"] = f"{n_pf} P / OFF cases deleted."
-                st.rerun()
-
-        with st.container(border=True, key="card_import"):
-            st.markdown(card_header_html("list", "Import old database",
-                                         "Bring cases, UA offences, UPL and sites over from the old portal's wbc.db (users are not imported - give access on the Admin Access page)"),
-                        unsafe_allow_html=True)
-            up = st.file_uploader("Old wbc.db", type=["db", "sqlite", "sqlite3"], key="imp_file")
-            mode = st.radio("Mode", ["Merge into current data (old rows win on the same ID)",
-                                     "Replace everything with the old database"], key="imp_mode")
-            replace = mode.startswith("Replace")
-            drop = st.checkbox("Also delete untouched roster placeholder cases (CASE-… still Open) that are not in the old database",
-                               key="imp_drop", disabled=replace)
-            st.caption("A timestamped backup of the current database is created first.")
-            if st.button("Import", type="primary", disabled=up is None, key="imp_run"):
-                ok, msg = import_old_db(up.getvalue(), replace=replace, drop_roster_placeholders=drop)
-                (st.success if ok else st.error)(msg)
+        folder_rows = []
+        for f in sorted(set(info["folders"]) | set(SITE_FOLDERS)):
+            m = info["folders"].get(f)
+            folder_rows.append({"Folder": f, "Sites": ", ".join(SITE_FOLDERS.get(f, [])) or "(read from files)",
+                                "Files in folder": m["total"] if m else "not found in storage",
+                                f"Files read (last {LOOKBACK_DAYS} days)": m["loaded"] if m else 0,
+                                "Newest file": (m["latest"] or "–") if m else "–"})
+        st.dataframe(pd.DataFrame(folder_rows), use_container_width=True, hide_index=True)
+        for w in info["warnings"][:15]:
+            st.warning(w)
+        if len(info["warnings"]) > 15:
+            st.caption(f"... and {len(info['warnings']) - 15} more warnings.")
 
 
 # ----------------------------------------------------------------
@@ -1646,7 +1839,22 @@ def page_settings():
 # ----------------------------------------------------------------
 def main():
     st.markdown(BASE_CSS, unsafe_allow_html=True)
-    init_db()
+
+    # ---------- storage must be reachable (it is the only database) ----------
+    conn = s3_status()
+    if not conn["connected"]:
+        st.markdown(LOGIN_CSS, unsafe_allow_html=True)
+        st.markdown("<div style='height:9vh'></div>", unsafe_allow_html=True)
+        _, mid, _ = st.columns([1, 1.6, 1])
+        with mid:
+            with st.container(border=True, key="card_login"):
+                st.markdown(BRAND_HTML + '<div class="login-t">Canopy storage is not connected</div>', unsafe_allow_html=True)
+                st.error(conn["message"])
+                st.code(f"bucket: {conn['bucket']}\nprefix: {conn['prefix']}")
+                if st.button("Retry connection", use_container_width=True):
+                    _s3_connect.clear()
+                    st.rerun()
+        st.stop()
 
     if "token" not in st.session_state:
         st.session_state.token = ""
@@ -1685,11 +1893,10 @@ def main():
         st.Page(page_ua, title="UA Offences Tracker", icon=":material/shield:", url_path="ua-offences"),
         st.Page(page_upl, title="UPL Summary Analytics", icon=":material/bar_chart:", url_path="upl-summary"),
         st.Page(page_disciplinary, title="Disciplinary Actions", icon=":material/gavel:", url_path="disciplinary"),
-        st.Page(page_sync, title="DWD Sync", icon=":material/sync:", url_path="dwd-sync"),
         st.Page(page_settings, title="Settings", icon=":material/settings:", url_path="settings"),
     ]
     if can_manage_access(user):          # only people who can give access see this page
-        pages.insert(6, st.Page(page_users, title="Admin Access", icon=":material/admin_panel_settings:",
+        pages.insert(5, st.Page(page_users, title="Admin Access", icon=":material/admin_panel_settings:",
                                 url_path="admin-access"))
     try:
         nav = st.navigation(pages, position="hidden")
@@ -1700,6 +1907,10 @@ def main():
         st.markdown(BRAND_HTML, unsafe_allow_html=True)
         for p in pages:
             st.page_link(p, label=p.title, icon=p.icon)
+        with st.container(key="refresh"):
+            if st.button("↻ Reload data", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
         with st.container(key="signout"):
             if st.button("Sign out", use_container_width=True):
                 st.session_state.clear()
