@@ -1,99 +1,160 @@
+import streamlit as st
 import pandas as pd
+import io
 
-def audit_pay_defects(schedule_path, shift_interval_path, dmd_path, tayseer_path, output_path="pay_defects_audit_report.xlsx"):
-    # Load all files (supports .csv or .xlsx)
-    def load_file(path):
-        return pd.read_excel(path) if path.endswith(('.xlsx', '.xls')) else pd.read_csv(path)
+st.set_page_config(page_title="Pay Defects Audit Tool", layout="wide")
 
-    df_schedule = load_file(schedule_path)
-    df_shift = load_file(shift_interval_path)
-    df_dmd = load_file(dmd_path)
-    df_tayseer = load_file(tayseer_path)
+st.title("🛡️ Pay Defects & Payroll Anomaly Auditor")
+st.markdown("Upload your monthly payroll tracking files to flag schedule, punch, rest day, and leave defects before cutoff.")
 
-    # ---------------------------------------------------------
-    # 1. Audit Schedule File
-    # ---------------------------------------------------------
-    # Expected columns: Associate_ID, Date, Working_Hours, Punch_Count
-    schedule_defects = []
+# ---------------------------------------------------------
+# File Uploaders
+# ---------------------------------------------------------
+col1, col2 = st.columns(2)
 
-    for idx, row in df_schedule.iterrows():
-        reasons = []
-        # Check working hours (< 5 hours is incorrect)
-        if pd.notna(row.get('Working_Hours')) and float(row['Working_Hours']) < 5.0:
-            reasons.append("Working hours less than 5 hrs")
-        
-        # Check punch count (only 4 and 6 are valid)
-        punch_cnt = row.get('Punch_Count')
-        if pd.notna(punch_cnt) and int(punch_cnt) not in [4, 6]:
-            reasons.append(f"Mispunch: {int(punch_cnt)} punches (expected 4 or 6)")
+with col1:
+    f_schedule = st.file_uploader("1. Upload Schedule File (schedule.csv / .xlsx)", type=["csv", "xlsx", "xls"])
+    f_shift = st.file_uploader("2. Upload Shift Interval File (shift_interval.csv / .xlsx)", type=["csv", "xlsx", "xls"])
 
-        if reasons:
-            defect_row = row.to_dict()
-            defect_row['Defect_Reason'] = "; ".join(reasons)
-            schedule_defects.append(defect_row)
+with col2:
+    f_dmd = st.file_uploader("3. Upload DMD File (DMD.csv / .xlsx)", type=["csv", "xlsx", "xls"])
+    f_tayseer = st.file_uploader("4. Upload Tayseer File (tayseer.csv / .xlsx)", type=["csv", "xlsx", "xls"])
 
-    df_schedule_defects = pd.DataFrame(schedule_defects)
+def load_file(uploaded_file):
+    if uploaded_file.name.endswith(('.xlsx', '.xls')):
+        return pd.read_excel(uploaded_file)
+    return pd.read_csv(uploaded_file)
 
-    # ---------------------------------------------------------
-    # 2. Audit Shift Interval vs DMD (Rest Day Mismatch)
-    # ---------------------------------------------------------
-    # Expected columns: Associate_ID, Date, Shift_Type (or Rest_Day flag)
-    # Merging on Associate_ID and Date
-    merged_shifts = pd.merge(
-        df_dmd, 
-        df_shift, 
-        on=['Associate_ID', 'Date'], 
-        suffixes=('_dmd', '_shift_interval'), 
-        how='inner'
-    )
+# Helper function to match column names case-insensitively
+def find_col(df, options):
+    for col in df.columns:
+        clean = col.strip().lower().replace(" ", "_")
+        for opt in options:
+            if opt in clean:
+                return col
+    return None
 
-    # Check where DMD indicates a rest day but shift interval doesn't match
-    # Adjust 'Shift_Type' or status column name as per your exact files
-    rest_day_mismatches = merged_shifts[
-        (merged_shifts['Shift_Type_dmd'].astype(str).str.upper().str.contains("REST|OFF")) & 
-        (merged_shifts['Shift_Type_shift_interval'].astype(str).str.upper() != merged_shifts['Shift_Type_dmd'].astype(str).str.upper())
-    ].copy()
+# ---------------------------------------------------------
+# Audit Processing
+# ---------------------------------------------------------
+if st.button("🚀 Run Audit", type="primary"):
+    if not (f_schedule and f_shift and f_dmd and f_tayseer):
+        st.error("Please upload all 4 files before running the audit.")
+    else:
+        try:
+            df_schedule = load_file(f_schedule)
+            df_shift = load_file(f_shift)
+            df_dmd = load_file(f_dmd)
+            df_tayseer = load_file(f_tayseer)
 
-    if not rest_day_mismatches.empty:
-        rest_day_mismatches['Defect_Reason'] = "Rest Day Mismatch: DMD shows Rest Day but Shift Interval does not match"
+            # 1. Audit Schedule File (< 5 hours and punch != 4, 6)
+            schedule_defects = []
+            col_hrs = find_col(df_schedule, ["working_hour", "work_hour", "total_hour", "hours"])
+            col_punches = find_col(df_schedule, ["punch", "total_punch", "punches"])
 
-    # ---------------------------------------------------------
-    # 3. Audit Tayseer File (Pending Leaves)
-    # ---------------------------------------------------------
-    # Expected columns: Associate_ID, Leave_Type, Approval_Status
-    tayseer_pending = df_tayseer[
-        df_tayseer['Approval_Status'].astype(str).str.upper().str.contains("PENDING")
-    ].copy()
+            for _, row in df_schedule.iterrows():
+                reasons = []
+                if col_hrs and pd.notna(row.get(col_hrs)):
+                    try:
+                        if float(row[col_hrs]) < 5.0:
+                            reasons.append("Working hours less than 5 hrs")
+                    except (ValueError, TypeError):
+                        pass
 
-    if not tayseer_pending.empty:
-        tayseer_pending['Defect_Reason'] = "Leave Approval Pending in Tayseer"
+                if col_punches and pd.notna(row.get(col_punches)):
+                    try:
+                        if int(row[col_punches]) not in [4, 6]:
+                            reasons.append(f"Mispunch: {row[col_punches]} punches (expected 4 or 6)")
+                    except (ValueError, TypeError):
+                        pass
 
-    # ---------------------------------------------------------
-    # Export to Excel with separate tabs for easy actioning
-    # ---------------------------------------------------------
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        if not df_schedule_defects.empty:
-            df_schedule_defects.to_excel(writer, sheet_name='Schedule & Mispunch Defects', index=False)
-        else:
-            pd.DataFrame([{"Status": "No schedule defects found"}]).to_excel(writer, sheet_name='Schedule & Mispunch Defects', index=False)
+                if reasons:
+                    defect_row = row.to_dict()
+                    defect_row["Defect_Reason"] = "; ".join(reasons)
+                    schedule_defects.append(defect_row)
 
-        if not rest_day_mismatches.empty:
-            rest_day_mismatches.to_excel(writer, sheet_name='Rest Day Mismatches', index=False)
-        else:
-            pd.DataFrame([{"Status": "All rest days match DMD"}]).to_excel(writer, sheet_name='Rest Day Mismatches', index=False)
+            df_schedule_res = pd.DataFrame(schedule_defects)
 
-        if not tayseer_pending.empty:
-            tayseer_pending.to_excel(writer, sheet_name='Pending Tayseer Leaves', index=False)
-        else:
-            pd.DataFrame([{"Status": "No pending leaves found"}]).to_excel(writer, sheet_name='Pending Tayseer Leaves', index=False)
+            # 2. Audit Shift Interval vs DMD (Rest Day Mismatch)
+            col_id_dmd = find_col(df_dmd, ["associate_id", "employee_id", "login", "id", "badge"])
+            col_date_dmd = find_col(df_dmd, ["date", "shift_date", "day"])
+            col_shift_dmd = find_col(df_dmd, ["shift", "rest", "schedule", "type"])
 
-    print(f"Audit completed. Report saved to: {output_path}")
+            col_id_shift = find_col(df_shift, ["associate_id", "employee_id", "login", "id", "badge"])
+            col_date_shift = find_col(df_shift, ["date", "shift_date", "day"])
+            col_shift_shift = find_col(df_shift, ["shift", "rest", "schedule", "type"])
 
-# Run the audit (replace with your file paths):
-if __name__ == "__main__":
-    audit_pay_defects(
-        schedule_path="schedule.csv",
-        shift_interval_path="shift_interval.csv",
-        dmd_path="DMD.csv",
-        tayseer_path="tayseer.csv"
-    )
+            rest_day_mismatches = pd.DataFrame()
+            if all([col_id_dmd, col_date_dmd, col_id_shift, col_date_shift, col_shift_dmd, col_shift_shift]):
+                merged_shifts = pd.merge(
+                    df_dmd,
+                    df_shift,
+                    left_on=[col_id_dmd, col_date_dmd],
+                    right_on=[col_id_shift, col_date_shift],
+                    suffixes=("_dmd", "_shift_interval"),
+                    how="inner"
+                )
+
+                dmd_type = merged_shifts[f"{col_shift_dmd}_dmd"].astype(str).str.upper()
+                shift_type = merged_shifts[f"{col_shift_shift}_shift_interval"].astype(str).str.upper()
+
+                rest_day_mismatches = merged_shifts[
+                    dmd_type.str.contains("REST|OFF") & (shift_type != dmd_type)
+                ].copy()
+
+                if not rest_day_mismatches.empty:
+                    rest_day_mismatches["Defect_Reason"] = "Rest Day Mismatch: DMD is Rest Day, but Shift Interval differs"
+
+            # 3. Audit Tayseer (Pending Leaves)
+            col_status = find_col(df_tayseer, ["status", "approval", "leave_status", "state"])
+            tayseer_pending = pd.DataFrame()
+            if col_status:
+                tayseer_pending = df_tayseer[
+                    df_tayseer[col_status].astype(str).str.upper().str.contains("PENDING")
+                ].copy()
+                if not tayseer_pending.empty:
+                    tayseer_pending["Defect_Reason"] = "Leave Approval Pending in Tayseer"
+
+            # ---------------------------------------------------------
+            # Display Results in Tabs
+            # ---------------------------------------------------------
+            st.success("Audit complete!")
+            tab1, tab2, tab3 = st.tabs(["1. Schedule & Punches", "2. Rest Day Mismatches", "3. Pending Tayseer Leaves"])
+
+            with tab1:
+                st.subheader(f"Schedule & Punch Defects ({len(df_schedule_res)})")
+                if not df_schedule_res.empty:
+                    st.dataframe(df_schedule_res)
+                else:
+                    st.info("No hours (<5h) or punch count defects found.")
+
+            with tab2:
+                st.subheader(f"Rest Day Mismatches ({len(rest_day_mismatches)})")
+                if not rest_day_mismatches.empty:
+                    st.dataframe(rest_day_mismatches)
+                else:
+                    st.info("No Rest Day discrepancies found between DMD and Shift Interval.")
+
+            with tab3:
+                st.subheader(f"Pending Leaves in Tayseer ({len(tayseer_pending)})")
+                if not tayseer_pending.empty:
+                    st.dataframe(tayseer_pending)
+                else:
+                    st.info("No pending leaves found in Tayseer.")
+
+            # Download Combined Report
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                (df_schedule_res if not df_schedule_res.empty else pd.DataFrame([{"Status": "Clean"}])).to_excel(writer, sheet_name="Schedule_Defects", index=False)
+                (rest_day_mismatches if not rest_day_mismatches.empty else pd.DataFrame([{"Status": "Clean"}])).to_excel(writer, sheet_name="Rest_Day_Mismatches", index=False)
+                (tayseer_pending if not tayseer_pending.empty else pd.DataFrame([{"Status": "Clean"}])).to_excel(writer, sheet_name="Pending_Leaves", index=False)
+
+            st.download_button(
+                label="📥 Download Full Excel Audit Report",
+                data=output.getvalue(),
+                file_name="payroll_defects_audit_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+        except Exception as e:
+            st.error(f"Error during processing: {e}")
